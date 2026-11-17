@@ -33,7 +33,7 @@ impl StartupDiagnostics {
             .build(&log_directory)?;
         let (file_writer, writer_guard) = tracing_appender::non_blocking(file_appender);
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "cursor_byok_desktop=info,cursor_server=info".into());
+            .unwrap_or_else(|_| "cursor_byok_desktop_lib=info,cursor_server=info".into());
 
         tracing_subscriber::registry()
             .with(filter)

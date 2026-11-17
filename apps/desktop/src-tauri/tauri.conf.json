@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Cursor BYOK",
-  "version": "1.0.1",
+  "version": "1.0.0",
   "identifier": "dev.cursorbyok.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -33,9 +33,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc1MEY2RjQzRjA0MjhCMDUKUldRRmkwTHdRMjhQZGJJam9zT1NwcW83L1V4ckJvbkQzQ0FYVFZ6MGRpa1N2NVFkUHk1dW14c1AK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE3NTQxQjY5RkQ0ODg2OUEKUldTYWhrajlhUnRVRjNiTjR4RXRGV0ZIdTJCeTJaNjg3U1o5ZTRuVmxhV0NTdTJNV1M5ZWhTbW8K",
       "endpoints": [
-        "https://github.com/leookun/cursor-byok/releases/latest/download/latest.json"
+        "https://github.com/vevila2020/cursor-byok/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

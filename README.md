@@ -1,113 +1,107 @@
-## 👋Is Cursor getting too heavy?  ✨ **New from the same author** → [BaoCode](https://github.com/baocode-dev/baocode) — an awesome desktop GUI for Claude Code: polished, ultra-small, ultra-light.
+# Cursor BYOK
 
-<div align="center">
+A local model gateway that connects Cursor to your own OpenAI- and Anthropic-compatible APIs.
 
-# cursor-byok
-cursor-byok is a local implementation of Cursor's backend.
-<br>
-<br>
-<a href="https://trendshift.io/repositories/39260?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-39260" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/39260" alt="leookun/cursor-byok | Trendshift" width="250" height="55" /></a>
+**Author: Elias**
 
-[User Guide](https://docs.leokun.cn) · [Download](https://github.com/leookun/cursor-byok/releases/latest) · [Report an Issue](https://github.com/leookun/cursor-byok/issues) · [中文版本说明](./README-CN.md)
-
-[![Release](https://img.shields.io/github/v/release/leookun/cursor-byok?style=flat-square)](https://github.com/leookun/cursor-byok/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/leookun/cursor-byok/total?style=flat-square)](https://github.com/leookun/cursor-byok/releases)
-[![License](https://img.shields.io/github/license/leookun/cursor-byok?style=flat-square)](./LICENSE)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey?style=flat-square)](https://github.com/leookun/cursor-byok/releases/latest)
-
-
-
-</div>
-
-![Connect cursor-byok to a wide range of model APIs](./images/en-brand-1.png)
-
-![cursor-byok dashboard](./images/en-home-1.png)
-
-## About
-
-cursor-byok is an open-source local model gateway for Cursor. It runs a service on your machine that connects Cursor to the model APIs you configure, routes model requests through your own providers, and preserves Cursor Agent capabilities such as tool calling, Skills, and MCP.
-
-You can connect OpenAI- and Anthropic-compatible services, customize endpoints, model IDs, API keys, and request parameters, and use model channels beyond the options built into the platform.
-
-> [!IMPORTANT]
-> cursor-byok is free and open source, but the model APIs you connect may charge for usage. This is an independent project and is not affiliated with or endorsed by Cursor or its developers.
+[简体中文](./README-CN.md) · [Download](https://github.com/vevila2020/cursor-byok/releases/latest) · [Report an issue](https://github.com/vevila2020/cursor-byok/issues)
 
 ## Features
 
-- **Bring your own model channels:** Configure your own API endpoint, credentials, and model IDs.
-- **Multiple API protocols:** Use OpenAI- and Anthropic-compatible APIs or a custom endpoint.
-- **Model management:** Add, duplicate, edit, reorder, and batch-test multiple model configurations.
-- **Connection benchmarks:** Measure time to first token, generation speed, and inspect raw provider responses.
-- **Agent workflows:** Keep tool calling, Skills, MCP, and multi-turn conversations available.
-- **Session metrics:** Track token usage, cache hit rate, conversation turns, and estimated value.
-- **Cross-platform:** Run on macOS, Windows, and Linux.
+- Connect your own API endpoints, keys, and model IDs.
+- Support OpenAI Responses, OpenAI Chat Completions, and Anthropic Messages APIs.
+- Add, edit, group, reorder, and test model configurations.
+- Use Cursor Agent tool calling, Skills, MCP, and multi-turn conversations.
+- Inspect request details, token usage, cache hits, and connection performance.
+- Run on Windows, macOS, and Linux.
 
-## Quick Start
+![Model configuration](./images/en-model-1.png)
 
-1. Download the latest build for your platform from [GitHub Releases](https://github.com/leookun/cursor-byok/releases/latest).
-2. Launch cursor-byok, open **Model Settings**, and enter the endpoint, API key, and model ID.
-3. Test the model configuration. Once it passes, return to the dashboard and start the service.
-4. Test the model configuration. Once it passes, return to the dashboard and start the service.
-5. After upgrading Cursor or configuring a model for the first time, quit Cursor completely and restart it, then start a new conversation and select the configured model.
+## Quick start
 
-For complete installation steps, system configuration, and Frequently Asked Questions, see the [User Guide](https://docs.leokun.cn).
+1. Download the installer for your system from [GitHub Releases](https://github.com/vevila2020/cursor-byok/releases/latest).
+2. Launch Cursor BYOK, open **Model Configuration → Cursor**, and initialize the local CA certificate when prompted.
+3. Add a model. Next to **Base URL**, click **Use Elias endpoint** to fill in `https://subapi.elias.kdns.fr`.
+4. Click **Get API key** to open [the key management page](https://subapi.elias.kdns.fr/keys), then copy your key into **API Key**.
+5. Choose the API protocol and enter a model ID, display name, and remark. You can also use **Fetch models** to load available model IDs.
+6. Click **Save and test**. After the test succeeds, enable Cursor integration and keep Cursor BYOK running.
+7. Fully quit and restart Cursor, start a new conversation, and select your configured model.
 
-## Model Management
+Restart Cursor after its first configuration or an upgrade. Select your model explicitly: **Auto** uses Cursor's official models.
 
-Model configurations support both OpenAI and Anthropic API protocols. Each model channel can independently define its context window, maximum output tokens, reasoning effort, custom headers, and additional request parameters.
+You can also enter another provider's Base URL and API key manually. The same Elias endpoint and key buttons are available in group settings; changes take effect after saving.
 
-![cursor-byok model settings](./images/en-model-1.png)
+## API configuration
 
-## How It Works
+| Model family | Model type | API protocol |
+| --- | --- | --- |
+| GPT / OpenAI | OpenAI | Responses API |
+| Other OpenAI-compatible models | OpenAI | Chat Completions API |
+| Claude / Anthropic-compatible models | Anthropic | Messages API |
+
+- **Base URL:** Use the provider's base address. The application appends the standard path for the selected protocol.
+- **Full request URL:** Enable this option only when supplying a complete endpoint URL. **Use Elias endpoint** switches this option off automatically.
+- **API Key:** Enter the key issued by your provider.
+- **Model ID:** Use the exact identifier accepted by the provider.
+- **Display name and remark:** Set the labels shown in Cursor.
+
+Context limits, output limits, reasoning effort, custom headers, and extra request parameters can be configured for each model.
+
+Keys and settings are stored locally. Model requests are sent to the API service you configure, which determines available models and usage charges.
+
+## How it works
 
 ```text
 Cursor client
-    │
     │ Agent requests and tool results
     ▼
-cursor-byok local service
-    │
+Cursor BYOK local service
     │ OpenAI- / Anthropic-compatible requests
     ▼
-Your model API
+Your configured model API
+    │ Model responses and tool calls
+    └──────────────────────────────► Cursor, through the local service
 ```
 
-cursor-byok handles protocol adaptation, model request forwarding, tool-call coordination, and conversation state on your machine. API keys and application settings are stored locally; requests are still sent to the model provider you configure.
+## Project structure
 
-## Why This Project
+```text
+cursor-byok/
+├── apps/desktop/          # React interface and Tauri desktop application
+│   ├── src/features/     # Model configuration, usage, calls, and settings
+│   ├── src/shared/       # Shared controls, API client, and application state
+│   ├── src/i18n/         # Localization runtime and translations
+│   └── src-tauri/        # Native window, lifecycle, and application updates
+├── server/               # Local gateway, protocol adaptation, and persistence
+├── crates/semble-core/   # Local code indexing and search
+├── protocols/cursor/     # Cursor protocol definitions
+├── support/              # Protocol tools and benchmarks
+└── .github/workflows/    # Continuous integration and release builds
+```
 
-Many Agent products bundle their tool capabilities with a fixed set of models, subscriptions, and billing options, leaving users limited to the channels offered by the platform.
+## Local development
 
-cursor-byok is built to return model choice to the user. Developers can make full use of the APIs and credits they already have, choose the models and providers that fit their needs, and self-host related services when required.
+Install Node.js 22.12 or later, Rust stable, and the [Tauri system prerequisites](https://v2.tauri.app/start/prerequisites/).
 
-## Roadmap
+```bash
+npm --prefix apps/desktop ci
+npm --prefix apps/desktop run tauri:dev
+```
 
-The project will continue to improve model compatibility, Agent tooling, local runtime stability, and the self-hosting experience while exploring support for more IDE, chat, and Agent workflows.
+Check types and build the frontend:
 
-See the [release roadmap](https://github.com/leookun/cursor-byok/discussions/32) for plans and progress.
+```bash
+npm --prefix apps/desktop run check
+```
 
-## Community and Support
+Build the desktop application without an installer:
 
-- [User Guide](https://docs.leokun.cn)
-- [GitHub Issues](https://github.com/leookun/cursor-byok/issues)
-- [Telegram community](https://t.me/cursor_byok)
-- QQ groups: `1095916242`, `1094411438`, `1095918002`, `1094419321`
+```bash
+npm --prefix apps/desktop run tauri:build -- --debug --no-bundle
+```
 
-
-
-## Development and Contributing
-
-Issues and pull requests are welcome. See the [Contributing Guide](./CONTRIBUTING_EN.md) for prerequisites, build commands, project structure, and contribution guidelines.
-
-## Contributors
-
-<a href="https://github.com/leookun/cursor-byok/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=leookun/cursor-byok" />
-</a>
-
+Run `make check` for workspace formatting, Clippy, Rust tests, and frontend checks. Installers and signed updater artifacts are built by the GitHub Actions release workflow.
 
 ## License
 
-This project is open source under the [MIT License](./LICENSE).
-
-
+[MIT](./LICENSE).

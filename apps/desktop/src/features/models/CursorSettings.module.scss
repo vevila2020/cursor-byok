@@ -317,6 +317,11 @@
   flex-direction: column;
   gap: 7px;
 }
+.endpointActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 .switches {
   display: flex;
   flex-direction: column;

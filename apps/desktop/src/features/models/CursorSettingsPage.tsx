@@ -4,6 +4,7 @@ import { api, configuredPluginModels, type Model, type ModelInput } from "../../
 import { CursorCaGate, CursorCaProvider, CursorModelGate, CursorModelProvider } from "./CursorGates";
 import { CursorModelCards, cursorModelGroups, type CursorModelGroup, type CursorModelGrouping } from "./CursorModelCards";
 import { CursorModelEditor, emptyCursorModelDraft, type CursorModelDraft } from "./CursorModelEditor";
+import { EliasApiActions } from "./EliasApiActions";
 import { CursorModelTestResult, type CursorModelTestState } from "./CursorModelTestResult";
 import styles from "./CursorSettings.module.scss";
 import { PageContent } from "../../shell/layout/PageContent";
@@ -40,6 +41,7 @@ export function CursorSettingsPage() {
   const [settingsGroup, setSettingsGroup] = useState<CursorModelGroup | null>(null);
   const [groupNameDraft, setGroupNameDraft] = useState("");
   const [groupBaseUrlDraft, setGroupBaseUrlDraft] = useState("");
+  const [groupUseBaseUrl, setGroupUseBaseUrl] = useState(false);
   const [groupApiKeyDraft, setGroupApiKeyDraft] = useState("");
   const [groupSettingsBusy, setGroupSettingsBusy] = useState(false);
   const activeModelTests = useRef(new Map<string, { testId: string; controller: AbortController; cancelling: boolean }>());
@@ -222,6 +224,7 @@ export function CursorSettingsPage() {
   const openGroupSettings = (group: CursorModelGroup) => {
     setGroupNameDraft(group.models.find((model) => model.group_name?.trim())?.group_name?.trim() ?? "");
     setGroupBaseUrlDraft(sharedValue(group.models.map((model) => model.base_url)) ?? "");
+    setGroupUseBaseUrl(false);
     setGroupApiKeyDraft(sharedValue(group.models.map((model) => model.api_key)) ?? "");
     setSettingsGroup(group);
   };
@@ -237,10 +240,12 @@ export function CursorSettingsPage() {
           ...modelInput(model),
           group_name,
           ...(base_url ? { base_url } : {}),
+          ...(base_url && groupUseBaseUrl ? { use_full_url: false } : {}),
           ...(api_key ? { api_key } : {}),
         };
         if (input.group_name === (model.group_name ?? null)
           && input.base_url === model.base_url
+          && input.use_full_url === model.use_full_url
           && input.api_key === model.api_key) continue;
         await api.updateModel(model.model_hash, input);
       }
@@ -352,8 +357,9 @@ export function CursorSettingsPage() {
           <TextInput placeholder={settingsGroup.key} value={groupNameDraft} onChange={(event) => setGroupNameDraft(event.target.value)} />
         </FormField>
         <FormField label={t("服务器地址")} hint={t("修改后应用于该分组下的全部模型；留空保持各模型现有配置不变。")}>
-          <TextInput placeholder={t("留空保持不变")} value={groupBaseUrlDraft} onChange={(event) => setGroupBaseUrlDraft(event.target.value)} />
+          <TextInput placeholder={t("留空保持不变")} value={groupBaseUrlDraft} onChange={(event) => { setGroupBaseUrlDraft(event.target.value); setGroupUseBaseUrl(false); }} />
         </FormField>
+        <EliasApiActions onApply={(baseUrl) => { setGroupBaseUrlDraft(baseUrl); setGroupUseBaseUrl(true); }} />
         <FormField label="API Key" hint={t("修改后应用于该分组下的全部模型；留空保持各模型现有配置不变。")}>
           <SecretTextInput placeholder={t("留空保持不变")} autoComplete="off" value={groupApiKeyDraft} onChange={(event) => setGroupApiKeyDraft(event.target.value)} />
         </FormField>
