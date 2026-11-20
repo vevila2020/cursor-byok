@@ -160,22 +160,15 @@ pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
         .map(|id| id.request_id.as_str())
         .filter(|id| !id.is_empty())
         .ok_or_else(|| Error::Protocol("BidiAppend request_id is required".into()))?;
-    if !request.data_binary.is_empty() {
-        return Err(Error::Protocol(
-            "BidiAppend data_binary is not part of the captured protocol".into(),
-        ));
-    }
-    if request.data.is_empty() {
+    if request.data_binary.is_empty() {
         return Err(Error::Protocol(
             "BidiAppend contains no AgentClientMessage".into(),
         ));
     }
-    let payload = hex::decode(&request.data)
-        .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?;
     Ok(DecodedAppend {
         request_id: request_id.into(),
         seqno: request.append_seqno,
-        message: agent::AgentClientMessage::decode(payload.as_slice())?,
+        message: agent::AgentClientMessage::decode(request.data_binary.as_slice())?,
     })
 }
 
@@ -208,4 +201,35 @@ pub async fn append(
         })
         .await?;
     Ok(ai::BidiAppendResponse {})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+
+    #[test]
+    fn decodes_agent_client_message_from_binary_data() {
+        let payload = agent::AgentClientMessage {
+            message: Some(agent::agent_client_message::Message::ClientHeartbeat(
+                agent::ClientHeartbeat {},
+            )),
+        }
+        .encode_to_vec();
+        let request = ai::BidiAppendRequest {
+            data_binary: payload,
+            request_id: Some(ai::BidiRequestId {
+                request_id: "binary-request".into(),
+            }),
+            ..Default::default()
+        };
+
+        let decoded = decode(&request).expect("binary AgentClientMessage should decode");
+
+        assert_eq!(decoded.request_id, "binary-request");
+        assert!(matches!(
+            decoded.message.message,
+            Some(agent::agent_client_message::Message::ClientHeartbeat(_))
+        ));
+    }
 }
