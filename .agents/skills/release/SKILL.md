@@ -9,8 +9,8 @@ Release through `.github/workflows/release.yml`. Preserve both updater formats: 
 
 ## Publication authority
 
-- Only the repository author, GitHub user `leookun`, may authorize a live release.
-- Before any live mutation, require an explicit release instruction from the author in the current task and verify `gh api user --jq .login` returns `leookun`.
+- Only the owner of the GitHub repository selected as the release target may authorize a live release. Determine the owner from that repository's remote URL at release time. Never hard-code a GitHub username.
+- Before any live mutation, require an explicit release instruction from the repository owner in the current task. Verify the authenticated GitHub account using the credential that will perform the mutation. Use `gh api user --jq .login` when publishing through GitHub CLI, or verify the account greeting from `ssh -T git@github.com` when pushing through SSH. The verified account must match the release target repository owner and the workflow's release-author check. A missing GitHub CLI login does not invalidate a separately verified SSH identity. Stop if the publishing credential identifies a different account or cannot be verified.
 - Treat all of these as publication actions: pushing a `v*` tag, rerunning the release workflow, and publishing or editing a GitHub Release. Pushing a release commit to `main` only prepares the release and must never trigger publication by itself.
 - Without that authorization, restrict work to inspection, local edits, validation, and a release-ready commit or branch. Do not infer publication permission from requests such as “prepare”, “check”, or “ready to release”.
 - Never print, commit, or upload `.tauri/cursor-byok.key` anywhere except the repository's `TAURI_SIGNING_PRIVATE_KEY` Actions Secret when the author explicitly requests that secret configuration.
