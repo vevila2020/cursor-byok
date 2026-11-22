@@ -231,73 +231,103 @@ async fn bidi_handler(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let (parts, body) = buffered(request).await?;
-    let request: ai::BidiAppendRequest = connect::decode_unary(&body)?;
-    let decoded = bidi::decode(&request)?;
-    let first_model = decoded.model_id().map(str::to_owned);
-    let conversation_id = decoded.conversation_id().map(str::to_owned);
-    let trace_metadata = decoded.trace_metadata();
-    let trace = registry.trace(&decoded.request_id);
-    let local = if let Some(model_id) = decoded.model_id() {
-        // 插件模型 ID 只在本地有意义,永远不转发到 Cursor 官方上游。
-        if model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
-            || registry.store().model(model_id).await?.is_some()
-        {
-            tracing::info!(
-                request_id = decoded.request_id,
-                model_id,
-                "routing Cursor Run to BYOK provider"
+    let request: ai::BidiAppendRequest = connect::decode_unary(&body).map_err(|error| {
+        tracing::warn!(
+            body_bytes = body.len(),
+            %error,
+            "failed to decode Cursor BidiAppend envelope"
+        );
+        error
+    })?;
+    let route_info = bidi::route_info(&request).map_err(|error| {
+        tracing::warn!(
+            request_id = ?request.request_id.as_ref().map(|id| id.request_id.as_str()),
+            data_binary_bytes = request.data_binary.len(),
+            %error,
+            "failed to extract Cursor BidiAppend routing fields"
+        );
+        error
+    })?;
+    let first_model = route_info.model_id.clone();
+    let trace = registry.trace(&route_info.request_id);
+    let route_metadata = serde_json::json!({
+        "append_seqno": request.append_seqno,
+        "message_type": if route_info.is_run_request { "run_request" } else { "upstream_append" },
+        "model_id": first_model.as_deref(),
+        "conversation_id": route_info.conversation_id.as_deref(),
+    });
+
+    if let Some(model_id) = first_model.as_deref() {
+        let local = model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
+            || registry.store().model(model_id).await?.is_some();
+        if !local {
+            trace.begin(
+                route_info.conversation_id.as_deref(),
+                "cursor_official",
+                Some(model_id),
             );
-            true
-        } else {
-            tracing::info!(
-                request_id = decoded.request_id,
-                model_id,
-                "routing Cursor Run to Cursor upstream"
+            registry.mark_upstream(&route_info.request_id).await;
+            trace.request(
+                "bidi_request",
+                body.clone(),
+                trace_outcome(route_metadata, true, "upstream", None),
             );
-            false
+            return proxy::forward(
+                Extension(proxy),
+                Request::from_parts(parts, Body::from(body)),
+            )
+            .await;
         }
-    } else if registry.local(&decoded.request_id).await.is_some() {
-        true
-    } else if registry.upstream(&decoded.request_id).await {
-        false
-    } else {
+    } else if registry.upstream(&route_info.request_id).await {
         trace.resume();
         trace.request(
             "bidi_request",
             body.clone(),
-            trace_outcome(trace_metadata, false, "missing_transport", None),
-        );
-        return Err(crate::Error::Protocol(
-            "first BidiAppend message must select a model".into(),
-        ));
-    };
-    if first_model.is_some() {
-        trace.begin(
-            conversation_id.as_deref(),
-            if local {
-                "local_byok"
-            } else {
-                "cursor_official"
-            },
-            first_model.as_deref(),
-        );
-    } else {
-        trace.resume();
-    }
-    if !local {
-        if first_model.is_some() {
-            registry.mark_upstream(&decoded.request_id).await;
-        }
-        trace.request(
-            "bidi_request",
-            body.clone(),
-            trace_outcome(trace_metadata, true, "upstream", None),
+            trace_outcome(route_metadata, true, "upstream", None),
         );
         return proxy::forward(
             Extension(proxy),
             Request::from_parts(parts, Body::from(body)),
         )
         .await;
+    }
+
+    if first_model.is_none() && registry.local(&route_info.request_id).await.is_none() {
+        trace.resume();
+        trace.request(
+            "bidi_request",
+            body.clone(),
+            trace_outcome(route_metadata, false, "missing_transport", None),
+        );
+        return Err(crate::Error::Protocol(
+            "first BidiAppend message must select a model".into(),
+        ));
+    }
+
+    let decoded = bidi::decode(&request).map_err(|error| {
+        tracing::warn!(
+            request_id = route_info.request_id,
+            model_id = ?first_model,
+            data_binary_bytes = request.data_binary.len(),
+            %error,
+            "failed to decode locally routed Cursor BidiAppend payload"
+        );
+        error
+    })?;
+    let trace_metadata = decoded.trace_metadata();
+    if let Some(model_id) = first_model.as_deref() {
+        tracing::info!(
+            request_id = route_info.request_id,
+            model_id,
+            "routing Cursor Run to BYOK provider"
+        );
+        trace.begin(
+            route_info.conversation_id.as_deref(),
+            "local_byok",
+            Some(model_id),
+        );
+    } else {
+        trace.resume();
     }
     let parent = match parent_headers(&parts.headers) {
         Ok(parent) => parent,
