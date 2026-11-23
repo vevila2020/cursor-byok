@@ -201,7 +201,7 @@ impl DecodedAppend {
     }
 }
 
-fn client_message_type(message: &agent::agent_client_message::Message) -> &'static str {
+pub(crate) fn client_message_type(message: &agent::agent_client_message::Message) -> &'static str {
     use agent::agent_client_message::Message;
     match message {
         Message::RunRequest(_) => "run_request",

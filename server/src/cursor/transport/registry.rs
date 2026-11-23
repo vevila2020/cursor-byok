@@ -12,8 +12,8 @@ use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::{
     cursor::{
-        conversation::ConversationRegistry, prompting::PromptCompiler,
-        services::observability::CursorTraceService,
+        conversation::ConversationRegistry, inference::InferenceRegistry,
+        prompting::PromptCompiler, services::observability::CursorTraceService,
     },
     plugin::PluginRegistry,
     provider::Provider,
@@ -39,6 +39,7 @@ struct RegistryInner {
     web_cache: WebCache,
     plugins: Option<PluginRegistry>,
     conversations: ConversationRegistry,
+    inference: InferenceRegistry,
 }
 
 #[derive(Clone)]
@@ -110,20 +111,24 @@ impl TransportRegistry {
         plugins: Option<PluginRegistry>,
         local_rules_dir: Option<std::path::PathBuf>,
     ) -> Self {
+        let traces = CursorTraceService::new(store.clone());
+        let inference = InferenceRegistry::new(store.clone(), provider.clone(), traces.clone());
         Self {
             inner: Arc::new(RegistryInner {
                 local: Mutex::new(HashMap::new()),
                 next_local_generation: AtomicU64::new(1),
                 upstream: Mutex::new(HashMap::new()),
                 route_changed: Notify::new(),
-                traces: CursorTraceService::new(store.clone()),
+                traces,
                 conversations: ConversationRegistry::new(
                     store.clone(),
                     provider,
                     compiler,
                     web_cache.clone(),
                     local_rules_dir,
+                    inference.clone(),
                 ),
+                inference,
                 store,
                 web_cache,
                 plugins,
@@ -152,6 +157,10 @@ impl TransportRegistry {
 
     pub fn conversations(&self) -> &ConversationRegistry {
         &self.inner.conversations
+    }
+
+    pub fn inference(&self) -> &InferenceRegistry {
+        &self.inner.inference
     }
 
     pub async fn get_or_create(&self, request_id: &str) -> Result<TransportHandle> {
@@ -219,6 +228,26 @@ impl TransportRegistry {
             .map(|transport| transport.handle.clone())
     }
 
+    /// Marks an already-started legacy run as local-loop owned, cancelling the
+    /// server-side model work while keeping the transport open for control
+    /// messages. No-op when the run request has not reached the runtime yet.
+    pub async fn enter_local_loop(&self, request_id: &str) {
+        if let Some(transport) = self.local(request_id).await {
+            let _ = transport
+                .command(crate::cursor::TransportCommand::SwitchToLocalLoop)
+                .await;
+        }
+    }
+
+    /// Reports the local loop's terminal interaction on the agent run stream.
+    pub async fn finish_local_loop(&self, request_id: &str, turn_completed: bool) {
+        if let Some(transport) = self.local(request_id).await {
+            let _ = transport
+                .command(crate::cursor::TransportCommand::LocalLoopFinished { turn_completed })
+                .await;
+        }
+    }
+
     pub async fn mark_upstream(&self, request_id: &str) {
         let mut upstream = self.inner.upstream.lock().await;
         let generation = upstream.get(request_id).copied().unwrap_or_default() + 1;
@@ -257,6 +286,7 @@ impl TransportRegistry {
     }
 
     pub async fn shutdown(&self) {
+        self.inner.inference.shutdown().await;
         self.inner.conversations.shutdown().await;
         let handles = std::mem::take(&mut *self.inner.local.lock().await);
         self.inner.upstream.lock().await.clear();

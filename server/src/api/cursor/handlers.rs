@@ -15,6 +15,7 @@ use crate::{
         run_sse,
     },
     cursor::{
+        inference::{self, AppendClass, InferenceRoute},
         protocol::{
             connect,
             proto::{agent::v1 as agent, aiserver::v1 as ai},
@@ -47,6 +48,10 @@ fn router_with_proxy(
     Router::new()
         .route("/__byok-api__/healthz", get(health))
         .route("/agent.v1.AgentService/RunSSE", post(run_sse_handler))
+        .route(
+            "/aiserver.v1.InferenceService/RunInferenceSSE",
+            post(run_inference_sse_handler),
+        )
         .route("/aiserver.v1.BidiService/BidiAppend", post(bidi_handler))
         .route(
             "/aiserver.v1.AiService/AvailableDocs",
@@ -225,6 +230,143 @@ async fn run_sse_handler(
     }
 }
 
+async fn run_inference_sse_handler(
+    State(registry): State<TransportRegistry>,
+    Extension(proxy): Extension<CursorProxy>,
+    request: Request<Body>,
+) -> Result<Response<Body>> {
+    let (parts, body) = buffered(request).await?;
+    let request: ai::BidiRequestId = connect::decode_unary(&body)?;
+    let inference = registry.inference();
+    inference.open_stream(&request.request_id).await;
+    match inference.wait_route(&request.request_id).await {
+        InferenceRoute::Local => {
+            let handle = inference
+                .local(&request.request_id)
+                .await
+                .ok_or_else(|| crate::Error::RunNotFound(request.request_id.clone()))?;
+            inference::stream::local(&handle).await
+        }
+        InferenceRoute::Upstream(generation) => {
+            let response = proxy::forward(
+                Extension(proxy),
+                Request::from_parts(parts, Body::from(body)),
+            )
+            .await?;
+            Ok(inference::stream::upstream(
+                inference.clone(),
+                request.request_id,
+                generation,
+                response,
+            )
+            .await)
+        }
+    }
+}
+
+async fn inference_append(
+    registry: TransportRegistry,
+    proxy: CursorProxy,
+    parts: axum::http::request::Parts,
+    body: Bytes,
+    request_id: String,
+    message: Box<inference::wire::RunInferenceClientMessage>,
+) -> Result<Response<Body>> {
+    let inference = registry.inference();
+    let kind = inference::message_kind(&message);
+    if inference.upstream(&request_id).await.is_some() {
+        tracing::info!(
+            request_id,
+            kind,
+            "forwarding Cursor RunInference append to official backend"
+        );
+        return proxy::forward(
+            Extension(proxy),
+            Request::from_parts(parts, Body::from(body)),
+        )
+        .await;
+    }
+    if inference.local(&request_id).await.is_some() {
+        let turn_completed = inference::is_turn_completed(&message);
+        inference.append(&request_id, *message).await?;
+        if turn_completed {
+            registry.finish_local_loop(&request_id, true).await;
+        }
+        return Ok(empty_proto());
+    }
+    let Some(model_id) = inference::run_request_model(&message) else {
+        tracing::warn!(
+            request_id,
+            kind,
+            "RunInference append arrived without a run_request"
+        );
+        return Err(crate::Error::Protocol(
+            "RunInference append must start with a run_request".into(),
+        ));
+    };
+    if inference::is_local_model(registry.store(), model_id).await? {
+        tracing::info!(
+            request_id,
+            model_id,
+            "routing Cursor RunInference to BYOK provider"
+        );
+        let conversation_id = inference::run_request_conversation(&message);
+        inference
+            .ensure_local(&request_id, conversation_id, Some(model_id))
+            .await?;
+        registry.enter_local_loop(&request_id).await;
+        inference.append(&request_id, *message).await?;
+        Ok(empty_proto())
+    } else {
+        tracing::info!(
+            request_id,
+            model_id,
+            "forwarding Cursor RunInference to official backend"
+        );
+        inference.mark_upstream(&request_id).await;
+        proxy::forward(
+            Extension(proxy),
+            Request::from_parts(parts, Body::from(body)),
+        )
+        .await
+    }
+}
+
+async fn inference_is_upstream(registry: &TransportRegistry, request_id: &str) -> bool {
+    let inference = registry.inference();
+    // The two streams are opened independently; an agent append can arrive
+    // before the RunInference stream has been registered. Wait briefly for it
+    // so official runs are never rejected for a scheduling race.
+    let open_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+    while !inference.has_open(request_id).await {
+        if tokio::time::Instant::now() >= open_deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if inference.upstream(request_id).await.is_some() {
+        return true;
+    }
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            inference.wait_route(request_id)
+        )
+        .await,
+        Ok(InferenceRoute::Upstream(_))
+    )
+}
+
+fn empty_proto() -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/proto"),
+    );
+    response
+}
+
 async fn bidi_handler(
     State(registry): State<TransportRegistry>,
     Extension(proxy): Extension<CursorProxy>,
@@ -239,6 +381,23 @@ async fn bidi_handler(
         );
         error
     })?;
+    let request_id = request
+        .request_id
+        .as_ref()
+        .map(|id| id.request_id.clone())
+        .unwrap_or_default();
+    let inference_open = registry.inference().has_open(&request_id).await;
+    let hex_payload = if request.data_binary.is_empty() && !request.data.is_empty() {
+        Some(inference::decode_hex(&request.data)?)
+    } else {
+        None
+    };
+    let payload = hex_payload
+        .as_deref()
+        .unwrap_or(request.data_binary.as_slice());
+    if let AppendClass::Inference(message) = inference::classify(payload, inference_open) {
+        return inference_append(registry, proxy, parts, body, request_id, message).await;
+    }
     let route_info = bidi::route_info(&request).map_err(|error| {
         tracing::warn!(
             request_id = ?request.request_id.as_ref().map(|id| id.request_id.as_str()),
@@ -290,9 +449,46 @@ async fn bidi_handler(
             Request::from_parts(parts, Body::from(body)),
         )
         .await;
+    } else if inference_is_upstream(&registry, &route_info.request_id).await {
+        // Cursor official models run through the same request ID's
+        // RunInference stream; once that stream is known to be upstream, every
+        // agent append belongs to the official backend even when it carries no
+        // model selector of its own.
+        tracing::info!(
+            request_id = route_info.request_id,
+            "forwarding Cursor AgentStream append to official backend"
+        );
+        registry.mark_upstream(&route_info.request_id).await;
+        trace.resume();
+        trace.request(
+            "bidi_request",
+            body.clone(),
+            trace_outcome(route_metadata, true, "upstream", None),
+        );
+        return proxy::forward(
+            Extension(proxy),
+            Request::from_parts(parts, Body::from(body)),
+        )
+        .await;
     }
 
     if first_model.is_none() && registry.local(&route_info.request_id).await.is_none() {
+        let message_type = bidi::decode(&request)
+            .ok()
+            .and_then(|decoded| {
+                decoded
+                    .message
+                    .message
+                    .as_ref()
+                    .map(bidi::client_message_type)
+            })
+            .unwrap_or("undecodable");
+        tracing::warn!(
+            request_id = route_info.request_id,
+            message_type,
+            data_binary_bytes = request.data_binary.len(),
+            "Cursor agent append has no model, local transport, or upstream route"
+        );
         trace.resume();
         trace.request(
             "bidi_request",

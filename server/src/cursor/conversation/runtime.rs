@@ -82,7 +82,30 @@ impl ConversationRuntime {
             let mut pending_finish = None::<(u64, TransportFinish)>;
             let mut draining = false;
             let mut waiting_for_action = false;
+            let mut passive = false;
             loop {
+                if passive {
+                    match receiver.recv().await {
+                        Some(TransportCommand::Disconnect) | None => {
+                            handle.mark_disconnected();
+                            super::finish_success(&handle);
+                            break;
+                        }
+                        Some(TransportCommand::Append { message, .. }) => {
+                            if is_cancel_action(&message) {
+                                dependencies.inference.cancel(handle.request_id()).await;
+                            }
+                        }
+                        Some(TransportCommand::LocalLoopFinished { turn_completed }) => {
+                            if turn_completed {
+                                let _ =
+                                    handle.emit(&crate::cursor::protocol::events::turn_ended(None));
+                            }
+                        }
+                        Some(_) => {}
+                    }
+                    continue;
+                }
                 let command = if draining {
                     if !handle.admissions_drained() {
                         tokio::select! {
@@ -145,6 +168,24 @@ impl ConversationRuntime {
                     }
                 };
                 match command {
+                    TransportCommand::LocalLoopFinished { .. } => {}
+                    TransportCommand::SwitchToLocalLoop => {
+                        if let Some(generation) = current.as_ref() {
+                            generation.superseded.cancel();
+                            if let Some(run) = generation.run.lock().clone() {
+                                run.cancel();
+                            }
+                        }
+                        current = None;
+                        pending_finish = None;
+                        draining = false;
+                        waiting_for_action = false;
+                        passive = true;
+                        tracing::info!(
+                            request_id = handle.request_id(),
+                            "switched Cursor run to local-loop inference"
+                        );
+                    }
                     TransportCommand::Disconnect => {
                         handle.mark_disconnected();
                         if let Some(generation) = current.as_ref() {
@@ -199,6 +240,19 @@ impl ConversationRuntime {
                                     Some(pb::agent_client_message::Message::RunRequest(
                                         request,
                                     )) => {
+                                        if dependencies
+                                            .inference
+                                            .has_open(handle.request_id())
+                                            .await
+                                        {
+                                            passive = true;
+                                            waiting_for_action = false;
+                                            tracing::info!(
+                                                request_id = handle.request_id(),
+                                                "Cursor agent host owns this run; serving local-loop inference only"
+                                            );
+                                            continue;
+                                        }
                                         waiting_for_action = false;
                                         if draining {
                                             handle.reopen();
@@ -822,6 +876,17 @@ fn spawn_run_request(
                 .await;
         }
     });
+}
+
+fn is_cancel_action(message: &pb::AgentClientMessage) -> bool {
+    matches!(
+        message.message.as_ref(),
+        Some(pb::agent_client_message::Message::ConversationAction(action))
+            if matches!(
+                action.action,
+                Some(pb::conversation_action::Action::CancelAction(_))
+            )
+    )
 }
 
 fn runtime_action_name(action: &pb::conversation_action::Action) -> &'static str {
