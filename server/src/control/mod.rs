@@ -223,6 +223,10 @@ pub fn api_router(service: ControlService) -> Router {
             post(harness::initialize_ca),
         )
         .route(
+            "/__byok-api__/api/harness/cursor/launch",
+            post(harness::launch_cursor),
+        )
+        .route(
             "/__byok-api__/api/harness/cursor/enabled",
             put(harness::set_enabled),
         )

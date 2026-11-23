@@ -178,6 +178,12 @@ export const appStore = {
     catch (cause) { update({ error: cause instanceof Error ? cause.message : String(cause) }); }
     finally { update({ cursorBusy: false }); }
   },
+  async launchCursor() {
+    update({ cursorBusy: true, error: null });
+    try { await api.launchCursor(); return true; }
+    catch (cause) { update({ error: cause instanceof Error ? cause.message : String(cause) }); return false; }
+    finally { update({ cursorBusy: false }); }
+  },
   async createModels(models: ModelInput[]) {
     update({ cursorBusy: true, error: null });
     try {

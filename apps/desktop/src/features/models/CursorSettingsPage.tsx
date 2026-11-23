@@ -72,6 +72,9 @@ export function CursorSettingsPage() {
     const status = await appStore.initializeCursorCa();
     if (status?.ca === "untrusted" && status.ca_install_command) setCaCommand(status.ca_install_command);
   };
+  const launchCursor = async () => {
+    if (await appStore.launchCursor()) message(t("Cursor 已启动"));
+  };
   const openNew = () => {
     const next = emptyCursorModelDraft();
     next.model.sort_order = models.length + 1;
@@ -308,6 +311,9 @@ export function CursorSettingsPage() {
   return <>
     <PageActions position="left">
       <div className={styles.takeoverActions}>
+        <TooltipTrigger label={cursorTakenOver ? t("启动 Cursor") : t("开启接管后可启动 Cursor")}>
+          <button type="button" className={styles.launchButton} disabled={cursorBusy || !cursorTakenOver} onClick={() => void launchCursor()}>{t("启动 Cursor")}</button>
+        </TooltipTrigger>
         <span className={styles.takeoverStatus}>{cursorTakenOver ? t("已接管") : t("未接管")}</span>
         <TooltipTrigger label={takeoverLabel}>
           <Switch

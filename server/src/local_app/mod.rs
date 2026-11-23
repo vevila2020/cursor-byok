@@ -152,6 +152,10 @@ impl CursorHarness {
         self.status().await
     }
 
+    pub async fn launch_cursor(&self) -> Result<()> {
+        process::launch_cursor().await
+    }
+
     pub async fn set_enabled(&self, enabled: bool) -> Result<CursorHarnessStatus> {
         if enabled {
             self.inner.store.set_cursor_takeover_enabled(true).await?;
