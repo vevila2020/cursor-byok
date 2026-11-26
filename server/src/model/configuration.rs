@@ -179,6 +179,13 @@ impl ModelConfig {
         }
     }
 
+    pub fn default_effort(&self) -> Option<&str> {
+        match self.model_type {
+            ModelType::OpenAi => self.reasoning_effort.as_deref(),
+            ModelType::Anthropic => self.anthropic_thinking_effort.as_deref(),
+        }
+    }
+
     pub fn extra_params(&self) -> &serde_json::Value {
         match self.model_type {
             ModelType::OpenAi if self.openai_extra_params_enabled => &self.openai_extra_params,
@@ -197,10 +204,7 @@ impl ModelConfig {
             model.context_window_tokens = self.context_window_tokens;
         }
         if model.reasoning.effort.is_none() {
-            model.reasoning.effort = match self.model_type {
-                ModelType::OpenAi => self.reasoning_effort.clone(),
-                ModelType::Anthropic => self.anthropic_thinking_effort.clone(),
-            };
+            model.reasoning.effort = self.default_effort().map(str::to_owned);
         }
         model.reasoning.enabled |= model.reasoning.effort.is_some();
     }

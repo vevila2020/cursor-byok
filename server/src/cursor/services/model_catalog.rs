@@ -459,6 +459,7 @@ fn available_model(model: &ModelConfig) -> AvailableModel {
         &tooltip,
         &contexts,
         true,
+        Some(model),
     );
     let legacy_slugs = variants
         .iter()
@@ -585,6 +586,7 @@ fn model_variants(
     tooltip: &TooltipData,
     contexts: &[(String, String)],
     thinking: bool,
+    config: Option<&ModelConfig>,
 ) -> Vec<ModelVariant> {
     // 非思考模型没有 Effort 轴,变体网格只剩 Context × Fast。
     let efforts: &[Option<(&str, &str)>] = if thinking {
@@ -599,17 +601,27 @@ fn model_variants(
         &[None]
     };
     let mut variants = Vec::with_capacity(contexts.len() * efforts.len() * 2);
-    for (context, context_name) in contexts {
+    let default_effort = config
+        .and_then(ModelConfig::default_effort)
+        .unwrap_or("high");
+    for context in contexts {
+        let is_default_context = match config.and_then(|model| model.context_window_tokens) {
+            Some(tokens) => parse_token_count(&context.0) == Some(tokens),
+            None => context.0 == DEFAULT_CONTEXT,
+        };
         for effort in efforts {
             for fast in [false, true] {
+                let is_default = is_default_context
+                    && !fast
+                    && effort.is_none_or(|(value, _)| value == default_effort);
                 variants.push(model_variant(
                     name,
                     display_name,
                     tooltip,
-                    context,
-                    context_name,
+                    (&context.0, &context.1),
                     *effort,
                     fast,
+                    is_default,
                 ));
             }
         }
@@ -621,10 +633,10 @@ fn model_variant(
     name: &str,
     display_name: &str,
     tooltip: &TooltipData,
-    context: &str,
-    context_name: &str,
+    (context, context_name): (&str, &str),
     effort: Option<(&str, &str)>,
     fast: bool,
+    is_default: bool,
 ) -> ModelVariant {
     let mut suffix = Vec::with_capacity(3);
     if context != DEFAULT_CONTEXT {
@@ -644,8 +656,6 @@ fn model_variant(
             "{display_name} <span style=\"color: var(--cursor-text-tertiary);\">{suffix}</span>"
         )
     };
-    let is_default =
-        context == DEFAULT_CONTEXT && !fast && effort.is_none_or(|(effort, _)| effort == "high");
     let mut parameter_values = vec![ModelParameterValue {
         id: "context".into(),
         value: context.into(),
@@ -696,7 +706,14 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
     };
     // Effort 与上下文档位由宿主统一提供,与内置模型一致;插件不再声明这两项。
     let contexts = context_options(None);
-    let variants = model_variants(&model.id, &model.display_name, &tooltip, &contexts, true);
+    let variants = model_variants(
+        &model.id,
+        &model.display_name,
+        &tooltip,
+        &contexts,
+        true,
+        None,
+    );
     let legacy_slugs = variants
         .iter()
         .filter_map(|variant| variant.legacy_slug.clone())
@@ -799,6 +816,32 @@ mod tests {
             thinking_budget_tokens: None,
             created_at_ms: 0,
             updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn picker_default_uses_the_saved_window_and_effort() {
+        let mut config = model();
+        config.reasoning_effort = Some("max".into());
+        for (tokens, value) in [(272_000, "272000"), (500_000, "500k")] {
+            config.context_window_tokens = Some(tokens);
+            let catalog = available_model(&config);
+            let defaults: Vec<_> = catalog
+                .variants
+                .iter()
+                .filter(|variant| variant.is_default_non_max_config == Some(true))
+                .collect();
+            assert_eq!(defaults.len(), 1);
+            assert_eq!(defaults[0].is_default_max_config, Some(true));
+            let parameters: Vec<_> = defaults[0]
+                .parameter_values
+                .iter()
+                .map(|parameter| (parameter.id.as_str(), parameter.value.as_str()))
+                .collect();
+            assert_eq!(
+                parameters,
+                [("context", value), ("reasoning", "max"), ("fast", "false")]
+            );
         }
     }
 

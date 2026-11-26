@@ -13,6 +13,7 @@ mod port;
 mod tool_round;
 
 pub use command::*;
+pub(crate) use compaction::is_context_overflow;
 pub use engine::*;
 pub use event::*;
 pub use handle::*;

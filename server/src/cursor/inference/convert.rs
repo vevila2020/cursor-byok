@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value;
 
 use crate::{
-    cursor::inference::wire::*,
+    cursor::inference::{model::InferenceModel, wire::*},
     model::{
         ContentPart, ModelInvocation, ModelRequest, ModelSpec, ProjectedContent, ProjectedMessage,
         PromptSpec, Role, ToolCallContent, ToolDefinition, ToolResultContent, Usage,
@@ -11,11 +11,10 @@ use crate::{
     Error, Result,
 };
 
-pub struct SessionInfo {
-    pub request_id: String,
-    pub conversation_id: String,
-    pub resolved_model_id: String,
-    pub is_anthropic: bool,
+pub(super) struct SessionInfo<'a> {
+    pub request_id: &'a str,
+    pub conversation_id: &'a str,
+    pub model: InferenceModel,
 }
 
 const REPLAY_CACHE_LIMIT: usize = 64;
@@ -86,18 +85,15 @@ impl ThinkingTextCache {
 }
 
 pub fn run_ready(
-    model_id: &str,
+    model: InferenceRequestedModel,
     display_name: Option<&str>,
     prompt_model_metadata: RunInferencePromptModelMetadata,
 ) -> RunInferenceServerMessage {
     RunInferenceServerMessage {
         message: Some(run_inference_server_message::Message::RunReady(
             RunInferenceRunReady {
-                resolved_model: Some(InferenceRequestedModel {
-                    model_id: model_id.into(),
-                    ..Default::default()
-                }),
-                supports_self_summary: false,
+                resolved_model: Some(model),
+                supports_self_summary: true,
                 routed_model_display_name: display_name.map(str::to_owned),
                 prompt_model_metadata: Some(prompt_model_metadata),
             },
@@ -110,24 +106,19 @@ pub fn run_ready(
 /// absent, and with "unrecognized-model-family" when vendor or prompt_version
 /// is not one of its known values.
 pub fn prompt_metadata(
-    model_id: &str,
-    model: Option<&crate::model::ModelConfig>,
+    model: &ModelSpec,
+    config: Option<&crate::model::ModelConfig>,
 ) -> RunInferencePromptModelMetadata {
-    let id = model_id.to_ascii_lowercase();
-    let vendor = vendor_for(&id, model);
-    let reasoning_effort = model
-        .and_then(|model| {
-            model
-                .reasoning_effort
-                .clone()
-                .or_else(|| model.anthropic_thinking_effort.clone())
-        })
-        .filter(|effort| {
-            matches!(
-                effort.as_str(),
-                "low" | "medium" | "high" | "extra-high" | "xhigh" | "max"
-            )
-        });
+    let id = config
+        .map_or(&model.model_id, |config| &config.model_id)
+        .to_ascii_lowercase();
+    let vendor = vendor_for(&id, config);
+    let reasoning_effort = model.reasoning.effort.clone().filter(|effort| {
+        matches!(
+            effort.as_str(),
+            "low" | "medium" | "high" | "extra-high" | "xhigh" | "max"
+        )
+    });
     let persona = if vendor == "xai" {
         ["grok-4.7", "grok-4.6", "grok-4.5"]
             .into_iter()
@@ -183,9 +174,7 @@ pub fn prompt_metadata(
         is_grok45_product_prompt: id.contains("grok-4.5"),
         is_grok46_product_prompt: id.contains("grok-4.6"),
         reasoning_effort,
-        agent_token_limit: model
-            .and_then(|model| model.context_window_tokens)
-            .map(|tokens| tokens.min(i32::MAX as u64) as i32),
+        agent_token_limit: model.context_window_tokens.map(wire_tokens),
         persona,
         self_identity_name: "Cursor".into(),
         agent_mode_configs,
@@ -452,13 +441,20 @@ fn json_to_prost(value: &Value) -> ::prost_types::Value {
     ::prost_types::Value { kind: Some(kind) }
 }
 
-pub fn usage_parts(usage: &Usage) -> Vec<inference_stream_response::Response> {
-    let number = |value: Option<u64>| value.unwrap_or_default().min(i32::MAX as u64) as i32;
+fn wire_tokens(tokens: u64) -> i32 {
+    tokens.min(i32::MAX as u64) as i32
+}
+
+pub fn usage_parts(
+    usage: &Usage,
+    context_window: Option<u64>,
+) -> Vec<inference_stream_response::Response> {
+    let number = |value: Option<u64>| wire_tokens(value.unwrap_or_default());
     let mut parts = vec![inference_stream_response::Response::Usage(
         InferenceUsageInfo {
             prompt_tokens: number(usage.input_tokens),
             completion_tokens: number(usage.output_tokens),
-            total_tokens: Some(number(usage.total_tokens)),
+            total_tokens: usage.total_tokens.map(wire_tokens),
         },
     )];
     parts.push(inference_stream_response::Response::ExtendedUsage(
@@ -467,9 +463,9 @@ pub fn usage_parts(usage: &Usage) -> Vec<inference_stream_response::Response> {
             output_tokens: number(usage.output_tokens),
             cache_read_tokens: number(usage.cache_read_tokens),
             cache_write_tokens: number(usage.cache_write_tokens),
-            max_tokens: 0,
-            reasoning_tokens: Some(number(usage.reasoning_tokens)),
-            context_input_tokens: Some(number(usage.context_input_tokens)),
+            max_tokens: number(context_window),
+            reasoning_tokens: usage.reasoning_tokens.map(wire_tokens),
+            context_input_tokens: usage.context_input_tokens.map(wire_tokens),
         },
     ));
     parts
@@ -493,26 +489,22 @@ pub fn invocation_end(
     }
 }
 
+pub fn input_token_limit(message: String) -> inference_stream_response::Response {
+    inference_stream_response::Response::Error(InferenceStreamError {
+        message,
+        is_input_token_limit_error: true,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn invocation_from_request(
-    session: &SessionInfo,
+pub(super) fn invocation_from_request(
+    session: SessionInfo<'_>,
     invocation_id: &str,
     request: &InferenceStreamRequest,
     provider_call_index: u64,
     replay: &ReplayCache,
     thinking: &ThinkingTextCache,
 ) -> Result<ModelInvocation> {
-    let model_id = if request.model_id.trim().is_empty() {
-        session.resolved_model_id.clone()
-    } else {
-        request.model_id.clone()
-    };
-    if model_id.is_empty() {
-        return Err(Error::Protocol(
-            "RunInference request is missing its model".into(),
-        ));
-    }
-
     let mut instructions = Vec::new();
     let mut seen_instructions = std::collections::HashSet::new();
     let mut history = Vec::new();
@@ -528,7 +520,7 @@ pub fn invocation_from_request(
             MESSAGE_ROLE_ASSISTANT => history.push(assistant_message(
                 message,
                 index,
-                session.is_anthropic,
+                session.model.is_anthropic,
                 replay,
                 thinking,
             )?),
@@ -551,9 +543,9 @@ pub fn invocation_from_request(
         } else {
             invocation_id.to_owned()
         },
-        run_id: session.request_id.clone(),
+        run_id: session.request_id.into(),
         conversation_id: if request.conversation_id.is_empty() {
-            session.conversation_id.clone()
+            session.conversation_id.into()
         } else {
             request.conversation_id.clone()
         },
@@ -563,7 +555,7 @@ pub fn invocation_from_request(
                 instructions: instructions.join("\n\n"),
                 tools,
             },
-            model: ModelSpec::new(model_id),
+            model: session.model.spec,
             history,
         },
     })
@@ -937,12 +929,11 @@ mod tests {
         }
     }
 
-    fn session() -> SessionInfo {
+    fn session() -> SessionInfo<'static> {
         SessionInfo {
-            request_id: "request".into(),
-            conversation_id: "conversation".into(),
-            resolved_model_id: "byok-model".into(),
-            is_anthropic: false,
+            request_id: "request",
+            conversation_id: "conversation",
+            model: InferenceModel::new("byok-model", None),
         }
     }
 
@@ -998,7 +989,7 @@ mod tests {
         };
 
         let invocation = invocation_from_request(
-            &session(),
+            session(),
             "invocation-1",
             &request,
             0,
@@ -1046,7 +1037,7 @@ mod tests {
         };
 
         let invocation = invocation_from_request(
-            &session(),
+            session(),
             "invocation-1",
             &request,
             0,
@@ -1160,7 +1151,7 @@ mod tests {
         );
 
         let invocation = invocation_from_request(
-            &session(),
+            session(),
             "invocation-1",
             &request,
             0,
@@ -1189,7 +1180,7 @@ mod tests {
             },
         );
         let invocation = invocation_from_request(
-            &session(),
+            session(),
             "invocation-2",
             &request,
             0,
@@ -1207,17 +1198,17 @@ mod tests {
 
     #[test]
     fn prompt_metadata_identifies_known_model_families() {
-        let grok = prompt_metadata("grok-4.7", None);
+        let grok = prompt_metadata(&ModelSpec::new("grok-4.7"), None);
         assert_eq!(grok.vendor, "xai");
         assert_eq!(grok.persona, "grok-4.7");
         assert_eq!(grok.prompt_version, "latest");
 
-        let claude = prompt_metadata("claude-opus-5-5", None);
+        let claude = prompt_metadata(&ModelSpec::new("claude-opus-5-5"), None);
         assert_eq!(claude.vendor, "anthropic");
         assert!(claude.is_opus55);
         assert!(claude.is_claude4x);
 
-        let gpt = prompt_metadata("gpt-6.1-sol", None);
+        let gpt = prompt_metadata(&ModelSpec::new("gpt-6.1-sol"), None);
         assert_eq!(gpt.vendor, "openai");
         assert!(gpt.is_gpt5_family);
         assert!(gpt
@@ -1285,7 +1276,7 @@ mod tests {
             cache_write_tokens: Some(3),
             reasoning_tokens: Some(1),
         };
-        let parts = usage_parts(&usage);
+        let parts = usage_parts(&usage, Some(272_000));
         assert_eq!(parts.len(), 2);
         let inference_stream_response::Response::Usage(basic) = &parts[0] else {
             panic!("expected basic usage");

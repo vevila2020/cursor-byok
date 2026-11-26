@@ -8,17 +8,20 @@ mod fixtures;
 
 use std::{sync::Arc, time::Duration};
 
+use axum::{http::header, routing::post, Json, Router};
 use cursor_server::{
     cursor::{
         inference::{wire::*, InferenceRegistry},
         protocol::{connect, proto::aiserver::v1 as ai},
         services::observability::CursorTraceService,
     },
-    model::{ModelConfigInput, ModelType, OPENAI_CHAT_ENDPOINT},
-    provider::ModelEvent,
+    model::{ModelConfigInput, ModelType, Usage, OPENAI_CHAT_ENDPOINT, OPENAI_RESPONSES_ENDPOINT},
+    network::NetworkClients,
+    plugin::{PluginRegistry, PluginRuntime},
+    provider::{ModelEvent, ProviderRouter},
 };
 use prost::Message;
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn model_input() -> ModelConfigInput {
     ModelConfigInput {
@@ -47,15 +50,26 @@ fn model_input() -> ModelConfigInput {
     }
 }
 
-fn run_request(model_id: &str) -> RunInferenceClientMessage {
+fn selection(model_id: &str, parameters: &[(&str, &str)]) -> InferenceRequestedModel {
+    InferenceRequestedModel {
+        model_id: model_id.into(),
+        parameters: parameters
+            .iter()
+            .map(|&(id, value)| InferenceModelParameterValue {
+                id: id.into(),
+                value: value.into(),
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn run_request(model: InferenceRequestedModel) -> RunInferenceClientMessage {
     RunInferenceClientMessage {
         message: Some(run_inference_client_message::Message::RunRequest(
             RunInferenceRunRequest {
                 conversation_id: "conversation-1".into(),
-                requested_model: Some(InferenceRequestedModel {
-                    model_id: model_id.into(),
-                    ..Default::default()
-                }),
+                requested_model: Some(model),
                 ..Default::default()
             },
         )),
@@ -63,23 +77,105 @@ fn run_request(model_id: &str) -> RunInferenceClientMessage {
 }
 
 fn invoke_model(model_id: &str) -> RunInferenceClientMessage {
+    invoke(
+        "invocation-1",
+        InferenceStreamRequest {
+            messages: vec![InferenceCoreMessage {
+                role: MESSAGE_ROLE_USER,
+                content: Some(inference_core_message::Content::Text("hello".into())),
+                ..Default::default()
+            }],
+            model_id: model_id.into(),
+            conversation_id: "conversation-1".into(),
+            ..Default::default()
+        },
+    )
+}
+
+fn invoke(id: &str, request: InferenceStreamRequest) -> RunInferenceClientMessage {
     RunInferenceClientMessage {
         message: Some(run_inference_client_message::Message::InvokeModel(
             RunInferenceInvokeModel {
-                invocation_id: "invocation-1".into(),
-                request: Some(InferenceStreamRequest {
-                    messages: vec![InferenceCoreMessage {
-                        role: MESSAGE_ROLE_USER,
-                        content: Some(inference_core_message::Content::Text("hello".into())),
-                        ..Default::default()
-                    }],
-                    model_id: model_id.into(),
-                    conversation_id: "conversation-1".into(),
-                    ..Default::default()
-                }),
+                invocation_id: id.into(),
+                request: Some(request),
             },
         )),
     }
+}
+
+#[tokio::test]
+async fn background_summary_and_main_call_keep_their_own_model_parameters() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let model = store
+        .create_model(&ModelConfigInput {
+            context_window_tokens: Some(272_000),
+            reasoning_effort: Some("max".into()),
+            ..model_input()
+        })
+        .await
+        .unwrap();
+    let provider = fake_provider::FakeProvider::default();
+    let finish = || {
+        vec![ModelEvent::Done(
+            cursor_server::provider::FinishReason::Stop,
+        )]
+    };
+    let main_call = provider.push_gated(finish());
+    provider.push(finish());
+    let registry = InferenceRegistry::new(
+        store.clone(),
+        Arc::new(provider.clone()),
+        CursorTraceService::new(store),
+    );
+    let handle = registry.ensure_local("run", None, None).await.unwrap();
+    let mut receiver = handle.subscribe();
+    registry
+        .append("run", run_request(selection(&model.model_hash, &[])))
+        .await
+        .unwrap();
+    let Some(run_inference_server_message::Message::RunReady(ready)) =
+        next_message(&mut receiver).await.message
+    else {
+        panic!("expected RunReady");
+    };
+    let metadata = ready.prompt_model_metadata.unwrap();
+    assert_eq!(metadata.agent_token_limit, Some(272_000));
+    assert_eq!(metadata.reasoning_effort.as_deref(), Some("max"));
+
+    registry
+        .append("run", invoke_model(&model.model_hash))
+        .await
+        .unwrap();
+    registry
+        .append(
+            "run",
+            invoke(
+                "summary",
+                InferenceStreamRequest {
+                    requested_model: Some(selection(
+                        &model.model_hash,
+                        &[("context", "200k"), ("reasoning", "low")],
+                    )),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    let summary = drain_invocation(&mut receiver).await;
+    assert_eq!(summary.invocation_id, "summary");
+    assert!(summary.error.is_none());
+    main_call.notify_one();
+    let main = drain_invocation(&mut receiver).await;
+    assert_eq!(main.invocation_id, "invocation-1");
+    assert!(main.error.is_none());
+
+    let requests = provider.requests();
+    assert_eq!(requests[0].model.context_window_tokens, Some(272_000));
+    assert_eq!(requests[0].model.reasoning.effort.as_deref(), Some("max"));
+    assert_eq!(requests[1].model.context_window_tokens, Some(200_000));
+    assert_eq!(requests[1].model.reasoning.effort.as_deref(), Some("low"));
 }
 
 async fn next_message(
@@ -100,7 +196,18 @@ async fn next_message(
 #[tokio::test]
 async fn run_inference_session_streams_provider_events() {
     let (_directory, store) = fixtures::temp_store().await;
-    let model = store.create_model(&model_input()).await.unwrap();
+    let model = store
+        .create_model(&ModelConfigInput {
+            context_window_tokens: Some(1_000_000),
+            reasoning_effort: Some("max".into()),
+            ..model_input()
+        })
+        .await
+        .unwrap();
+    let selected = selection(
+        &model.model_hash,
+        &[("context", "272000"), ("reasoning", "xhigh")],
+    );
     let provider = fake_provider::FakeProvider::default();
     provider.push(vec![
         ModelEvent::TextStart,
@@ -116,6 +223,10 @@ async fn run_inference_session_streams_provider_events() {
             delta: r#"{"glob_pattern":"**/*"}"#.into(),
         },
         ModelEvent::ToolCallEnd { index: 0 },
+        ModelEvent::Usage(Usage {
+            context_input_tokens: Some(246_000),
+            ..Default::default()
+        }),
         ModelEvent::Done(cursor_server::provider::FinishReason::ToolUse),
     ]);
 
@@ -130,7 +241,7 @@ async fn run_inference_session_streams_provider_events() {
         .unwrap();
     let mut receiver = handle.subscribe();
     registry
-        .append("request-1", run_request(&model.model_hash))
+        .append("request-1", run_request(selected.clone()))
         .await
         .unwrap();
 
@@ -138,12 +249,15 @@ async fn run_inference_session_streams_provider_events() {
     let run_inference_server_message::Message::RunReady(ready) = ready.message.unwrap() else {
         panic!("expected run_ready");
     };
-    assert_eq!(ready.resolved_model.unwrap().model_id, model.model_hash);
+    assert_eq!(ready.resolved_model.unwrap(), selected);
+    assert!(ready.supports_self_summary);
     let metadata = ready
         .prompt_model_metadata
         .expect("local loop requires prompt model metadata");
     assert_eq!(metadata.vendor, "openai");
     assert_eq!(metadata.prompt_version, "latest");
+    assert_eq!(metadata.agent_token_limit, Some(272_000));
+    assert_eq!(metadata.reasoning_effort.as_deref(), Some("xhigh"));
     assert!(metadata
         .agent_mode_configs
         .iter()
@@ -160,6 +274,7 @@ async fn run_inference_session_streams_provider_events() {
     let mut tool_delta = String::new();
     let mut tool_complete = None;
     let mut response_info = None;
+    let mut usage = None;
     let error = loop {
         let message = next_message(&mut receiver).await;
         match message.message.unwrap() {
@@ -190,8 +305,8 @@ async fn run_inference_session_streams_provider_events() {
                     inference_stream_response::Response::ResponseInfo(info) => {
                         response_info = Some(info);
                     }
-                    inference_stream_response::Response::Usage(_)
-                    | inference_stream_response::Response::ExtendedUsage(_) => {}
+                    inference_stream_response::Response::Usage(_) => {}
+                    inference_stream_response::Response::ExtendedUsage(part) => usage = Some(part),
                     other => panic!("unexpected inference response: {other:?}"),
                 }
             }
@@ -206,6 +321,9 @@ async fn run_inference_session_streams_provider_events() {
     };
 
     assert!(error.is_none(), "invocation ended with {error:?}");
+    let usage = usage.expect("Cursor needs extended usage to trigger compaction");
+    assert_eq!(usage.max_tokens, 272_000);
+    assert_eq!(usage.context_input_tokens, Some(246_000));
     assert!(text_finished, "invocation must end with a final text part");
     assert_eq!(text, "hi");
     assert!(tool_started, "tool call start must be streamed");
@@ -228,6 +346,188 @@ async fn run_inference_session_streams_provider_events() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].history.len(), 1);
     assert_eq!(requests[0].prompt.instructions, "");
+    assert_eq!(requests[0].model.context_window_tokens, Some(272_000));
+    assert_eq!(requests[0].model.reasoning.effort.as_deref(), Some("xhigh"));
+}
+
+#[tokio::test]
+async fn oversized_history_requests_compaction_before_contacting_the_provider() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let model = store.create_model(&model_input()).await.unwrap();
+    let provider = fake_provider::FakeProvider::default();
+    provider.push_error(cursor_server::Error::Provider(
+        "context_length_exceeded".into(),
+    ));
+    provider.push(vec![ModelEvent::Done(
+        cursor_server::provider::FinishReason::Stop,
+    )]);
+    let registry = InferenceRegistry::new(
+        store.clone(),
+        Arc::new(provider.clone()),
+        CursorTraceService::new(store),
+    );
+    let handle = registry
+        .ensure_local("resumed-run", None, None)
+        .await
+        .unwrap();
+    let mut receiver = handle.subscribe();
+    registry
+        .append(
+            "resumed-run",
+            run_request(selection(&model.model_hash, &[("context", "272000")])),
+        )
+        .await
+        .unwrap();
+    let _ready = next_message(&mut receiver).await;
+
+    for (id, text, provider_calls) in [
+        ("restored-history", "word ".repeat(1_000_000), 0),
+        (
+            "provider-overflow",
+            "input the provider counts differently".into(),
+            1,
+        ),
+    ] {
+        registry
+            .append(
+                "resumed-run",
+                invoke(
+                    id,
+                    InferenceStreamRequest {
+                        messages: vec![InferenceCoreMessage {
+                            role: MESSAGE_ROLE_USER,
+                            content: Some(inference_core_message::Content::Text(text)),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let Some(run_inference_server_message::Message::InvocationResponse(response)) =
+            next_message(&mut receiver).await.message
+        else {
+            panic!("expected an inference response")
+        };
+        assert_eq!(response.invocation_id, id);
+        let Some(inference_stream_response::Response::Error(error)) =
+            response.response.unwrap().response
+        else {
+            panic!("Cursor needs an input-token-limit error to compact and retry");
+        };
+        assert!(error.is_input_token_limit_error);
+        assert_eq!(drain_invocation(&mut receiver).await.invocation_id, id);
+        assert_eq!(provider.requests().len(), provider_calls);
+    }
+    registry
+        .append("resumed-run", invoke_model(&model.model_hash))
+        .await
+        .unwrap();
+    let retry = drain_invocation(&mut receiver).await;
+    assert!(retry.error.is_none());
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn openai_http_requests_carry_the_selected_effort() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let upstream = Router::new().route(
+        "/{*path}",
+        post(move |Json(body): Json<Value>| {
+            let sent = sent.clone();
+            async move {
+                let response = if body.get("messages").is_some() {
+                    "data: [DONE]\n\n"
+                } else {
+                    "data: {\"type\":\"response.completed\"}\n\n"
+                };
+                sent.send(body).unwrap();
+                ([(header::CONTENT_TYPE, "text/event-stream")], response)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let config = ModelConfigInput {
+        base_url,
+        reasoning_effort: Some("max".into()),
+        context_window_tokens: Some(272_000),
+        ..model_input()
+    };
+    let chat = store.create_model(&config).await.unwrap();
+    let responses = store
+        .create_model(&ModelConfigInput {
+            openai_endpoint: OPENAI_RESPONSES_ENDPOINT.into(),
+            ..config
+        })
+        .await
+        .unwrap();
+    let plugins = PluginRegistry::managed(
+        store.clone(),
+        PluginRuntime::managed().unwrap(),
+        "test".into(),
+    )
+    .unwrap();
+    let provider = ProviderRouter::new(
+        store.clone(),
+        plugins,
+        NetworkClients::new(store.clone()),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
+    let registry = InferenceRegistry::new(
+        store.clone(),
+        Arc::new(provider),
+        CursorTraceService::new(store),
+    );
+    let handle = registry.ensure_local("http", None, None).await.unwrap();
+    let mut receiver = handle.subscribe();
+    registry
+        .append(
+            "http",
+            run_request(selection(&chat.model_hash, &[("reasoning", "xhigh")])),
+        )
+        .await
+        .unwrap();
+    let _ready = next_message(&mut receiver).await;
+
+    for (id, requested, pointer, effort) in [
+        ("chat", None, "/reasoning_effort", "xhigh"),
+        (
+            "responses",
+            Some(selection(&responses.model_hash, &[("reasoning", "low")])),
+            "/reasoning/effort",
+            "low",
+        ),
+        (
+            "responses-default",
+            Some(selection(&responses.model_hash, &[])),
+            "/reasoning/effort",
+            "max",
+        ),
+    ] {
+        registry
+            .append(
+                "http",
+                invoke(
+                    id,
+                    InferenceStreamRequest {
+                        requested_model: requested,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let end = drain_invocation(&mut receiver).await;
+        assert!(end.error.is_none(), "{:?}", end.error);
+        let body = received.try_recv().unwrap();
+        assert_eq!(body.pointer(pointer).and_then(Value::as_str), Some(effort));
+    }
+    server.abort();
 }
 
 #[tokio::test]
@@ -275,7 +575,10 @@ async fn provider_replay_state_is_replayed_on_the_next_invocation() {
         .unwrap();
     let mut receiver = handle.subscribe();
     registry
-        .append("request-replay", run_request(&model.model_hash))
+        .append(
+            "request-replay",
+            run_request(selection(&model.model_hash, &[])),
+        )
         .await
         .unwrap();
     let _ready = next_message(&mut receiver).await;
@@ -351,14 +654,13 @@ async fn provider_replay_state_is_replayed_on_the_next_invocation() {
     );
 }
 
-async fn drain_invocation(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>) {
+async fn drain_invocation(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>,
+) -> RunInferenceInvocationEnd {
     loop {
         let message = next_message(receiver).await;
-        if matches!(
-            message.message,
-            Some(run_inference_server_message::Message::InvocationEnd(_))
-        ) {
-            return;
+        if let Some(run_inference_server_message::Message::InvocationEnd(end)) = message.message {
+            return end;
         }
     }
 }
@@ -390,7 +692,10 @@ async fn detailed_logging_records_the_local_loop_trace() {
         .unwrap();
     let mut receiver = handle.subscribe();
     registry
-        .append("request-trace", run_request(&model.model_hash))
+        .append(
+            "request-trace",
+            run_request(selection(&model.model_hash, &[])),
+        )
         .await
         .unwrap();
     let _ready = next_message(&mut receiver).await;
@@ -450,7 +755,7 @@ async fn finish_run_closes_the_inference_stream() {
         .unwrap();
     let mut receiver = handle.subscribe();
     registry
-        .append("request-2", run_request(&model.model_hash))
+        .append("request-2", run_request(selection(&model.model_hash, &[])))
         .await
         .unwrap();
     let _ready = next_message(&mut receiver).await;

@@ -19,13 +19,14 @@ use crate::{
     cursor::{
         inference::{
             convert::{self, SessionInfo},
+            model::{configured_model, InferenceModel},
             wire::*,
         },
         protocol::connect::{self, ConnectCode, ConnectStreamError, END_STREAM_FLAG},
         services::observability::{CursorTraceRecorder, CursorTraceService},
         transport::OutputHub,
     },
-    model::Usage,
+    model::{estimate_context_tokens, ModelInvocation, Usage},
     provider::{ModelEvent, Provider, ProviderStream},
     store::Store,
     Error, Result,
@@ -127,19 +128,29 @@ enum Command {
 }
 
 enum SessionEvent {
-    Frame {
-        invocation_id: String,
-        message: Box<RunInferenceServerMessage>,
-    },
+    Frame(Box<RunInferenceServerMessage>),
     Replay {
-        invocation_id: String,
         call_ids: Vec<String>,
         state: crate::model::ProviderReplayState,
     },
-    End {
-        invocation_id: String,
-        error: Option<(i32, String)>,
-    },
+    End(Option<(i32, String)>),
+}
+
+struct InvocationEvents {
+    index: u64,
+    invocation_id: String,
+    sender: mpsc::Sender<(u64, SessionEvent)>,
+}
+
+impl InvocationEvents {
+    async fn send(&self, event: SessionEvent) {
+        let _ = self.sender.send((self.index, event)).await;
+    }
+
+    async fn respond(&self, part: inference_stream_response::Response) {
+        let message = convert::invocation_response(&self.invocation_id, part);
+        self.send(SessionEvent::Frame(Box::new(message))).await;
+    }
 }
 
 impl InferenceRegistry {
@@ -308,13 +319,9 @@ impl InferenceRegistry {
     }
 }
 
-struct SessionState {
-    ready: bool,
-    resolved_model_id: String,
+struct PreparedSession {
     conversation_id: String,
-    call_index: u64,
-    is_anthropic: bool,
-    replay: convert::ReplayCache,
+    model: InferenceModel,
 }
 
 struct ActiveInvocation {
@@ -335,15 +342,11 @@ async fn run_session(
     mut commands: mpsc::Receiver<Command>,
 ) {
     let (events_tx, mut events) = mpsc::channel(EVENT_BUFFER);
-    let mut state = SessionState {
-        ready: false,
-        resolved_model_id: String::new(),
-        conversation_id: request_id.clone(),
-        call_index: 0,
-        is_anthropic: false,
-        replay: convert::ReplayCache::default(),
-    };
-    let mut active: Option<ActiveInvocation> = None;
+    let mut session = None;
+    let mut call_index = 0;
+    let mut replay = convert::ReplayCache::default();
+    // A background summary and the main model can be streaming at the same time.
+    let mut active = BTreeMap::<u64, ActiveInvocation>::new();
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
         HEARTBEAT_INTERVAL,
@@ -353,36 +356,35 @@ async fn run_session(
         tokio::select! {
             command = commands.recv() => match command {
                 None | Some(Command::Disconnect) => {
-                    stop_active(&mut active, &handle, false);
                     break;
                 }
                 Some(Command::CancelActive) => {
-                    stop_active(&mut active, &handle, true);
+                    for invocation in std::mem::take(&mut active).into_values() {
+                        invocation.stop(&handle, true);
+                    }
                 }
                 Some(Command::Append(message)) => match *message {
                     RunInferenceClientMessage { message: Some(run_inference_client_message::Message::RunRequest(request)) } => {
-                        if let Err(error) = prepare_session(
-                            &handle,
-                            &store,
-                            &request_id,
-                            &request,
-                            &mut state,
-                        ).await {
-                            tracing::warn!(request_id, %error, "RunInference session rejected its model");
-                            stop_active(&mut active, &handle, false);
-                            handle.close_with_error(error.to_string());
-                            break;
+                        match prepare_session(&handle, &store, &request_id, &request).await {
+                            Ok(prepared) => session = Some(prepared),
+                            Err(error) => {
+                                tracing::warn!(request_id, %error, "RunInference session rejected its model");
+                                handle.close_with_error(error.to_string());
+                                break;
+                            }
                         }
                     }
                     RunInferenceClientMessage { message: Some(run_inference_client_message::Message::InvokeModel(invocation)) } => {
-                        stop_active(&mut active, &handle, true);
-                        if !state.ready {
+                        if active.values().any(|call| call.invocation_id == invocation.invocation_id) {
+                            continue;
+                        }
+                        let Some(session) = session.as_ref() else {
                             handle.emit(&convert::invocation_end(
                                 &invocation.invocation_id,
                                 Some((13, "RunInference invoke_model arrived before run_request".into())),
                             ));
                             continue;
-                        }
+                        };
                         let Some(request) = invocation.request.as_ref() else {
                             handle.emit(&convert::invocation_end(
                                 &invocation.invocation_id,
@@ -390,38 +392,27 @@ async fn run_session(
                             ));
                             continue;
                         };
-                        let session = SessionInfo {
-                            request_id: request_id.clone(),
-                            conversation_id: state.conversation_id.clone(),
-                            resolved_model_id: state.resolved_model_id.clone(),
-                            is_anthropic: state.is_anthropic,
-                        };
-                        let index = state.call_index;
-                        state.call_index += 1;
-                        match convert::invocation_from_request(
-                            &session,
-                            &invocation.invocation_id,
-                            request,
-                            index,
-                            &state.replay,
-                            &thinking,
-                        ) {
-                            Ok(model_invocation) => {
-                                let invocation_id = invocation.invocation_id.clone();
-                                let cancellation = CancellationToken::new();
-                                let stream = provider.stream(model_invocation, cancellation.clone());
-                                let task = tokio::spawn(run_invocation(
-                                    invocation_id.clone(),
-                                    state.resolved_model_id.clone(),
-                                    stream,
-                                    events_tx.clone(),
-                                    thinking.clone(),
-                                ));
-                                active = Some(ActiveInvocation {
-                                    invocation_id,
-                                    cancellation,
-                                    task,
-                                });
+                        let index = call_index;
+                        call_index += 1;
+                        let model = session.model.for_invocation(&store, request).await;
+                        let call = model.and_then(|model| {
+                            let info = SessionInfo {
+                                request_id: &request_id,
+                                conversation_id: &session.conversation_id,
+                                model,
+                            };
+                            convert::invocation_from_request(info, &invocation.invocation_id, request, index, &replay, &thinking)
+                        });
+                        match call {
+                            Ok(call) => {
+                                let output = InvocationEvents {
+                                    index,
+                                    invocation_id: invocation.invocation_id,
+                                    sender: events_tx.clone(),
+                                };
+                                if let Some(call) = ActiveInvocation::start(call, output, &handle, provider.as_ref(), thinking.clone()) {
+                                    active.insert(index, call);
+                                }
                             }
                             Err(error) => {
                                 handle.emit(&convert::invocation_end(
@@ -432,16 +423,19 @@ async fn run_session(
                         }
                     }
                     RunInferenceClientMessage { message: Some(run_inference_client_message::Message::CancelInvocation(cancel)) } => {
-                        if active.as_ref().is_some_and(|active| active.invocation_id == cancel.invocation_id) {
-                            stop_active(&mut active, &handle, true);
-                        }
+                        active.retain(|_, call| {
+                            if call.invocation_id == cancel.invocation_id {
+                                call.stop(&handle, true);
+                                return false;
+                            }
+                            true
+                        });
                     }
                     RunInferenceClientMessage { message: Some(run_inference_client_message::Message::FinishRun(_)) } => {
-                        stop_active(&mut active, &handle, false);
                         break;
                     }
                     RunInferenceClientMessage { message: Some(run_inference_client_message::Message::ClientHeartbeat(_)) } => {
-                        if state.ready {
+                        if session.is_some() {
                             handle.emit(&convert::heartbeat());
                         }
                     }
@@ -455,36 +449,28 @@ async fn run_session(
                     | RunInferenceClientMessage { message: None } => {}
                 },
             },
-            Some(event) = events.recv() => match event {
-                SessionEvent::Frame { invocation_id, message } => {
-                    if active.as_ref().is_some_and(|active| active.invocation_id == invocation_id) {
-                        handle.emit(&message);
-                    }
-                }
-                SessionEvent::Replay {
-                    invocation_id,
-                    call_ids,
-                    state: replay,
-                } => {
-                    if active.as_ref().is_some_and(|active| active.invocation_id == invocation_id) {
-                        state.replay.insert(call_ids, replay);
-                    }
-                }
-                SessionEvent::End { invocation_id, error } => {
-                    if active.as_ref().is_some_and(|active| active.invocation_id == invocation_id) {
-                        handle.emit(&convert::invocation_end(&invocation_id, error));
-                        active = None;
+            Some((index, event)) = events.recv() => {
+                let Some(call) = active.get(&index) else { continue; };
+                match event {
+                    SessionEvent::Frame(message) => handle.emit(&message),
+                    SessionEvent::Replay { call_ids, state } => replay.insert(call_ids, state),
+                    SessionEvent::End(error) => {
+                        handle.emit(&convert::invocation_end(&call.invocation_id, error));
+                        active.remove(&index);
                     }
                 }
             },
             _ = heartbeat.tick() => {
-                if state.ready {
+                if session.is_some() {
                     handle.emit(&convert::heartbeat());
                 }
             }
         }
     }
 
+    for invocation in active.into_values() {
+        invocation.stop(&handle, false);
+    }
     handle.close();
     if let Some(inner) = registry.upgrade() {
         let mut sessions = inner.sessions.lock().await;
@@ -504,57 +490,46 @@ async fn prepare_session(
     store: &Store,
     request_id: &str,
     request: &RunInferenceRunRequest,
-    state: &mut SessionState,
-) -> Result<()> {
-    let model_id = request
+) -> Result<PreparedSession> {
+    let requested = request
         .requested_model
         .as_ref()
-        .map(|model| model.model_id.trim())
-        .filter(|model| !model.is_empty())
+        .filter(|model| !model.model_id.trim().is_empty())
         .ok_or_else(|| Error::Protocol("RunInference run_request has no requested model".into()))?;
-    let model_config = if model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX) {
-        None
-    } else {
-        Some(
-            store
-                .model(model_id)
-                .await?
-                .ok_or_else(|| Error::Protocol(format!("unknown model: {model_id}")))?,
-        )
-    };
-    if let Some(model) = &model_config {
-        state.is_anthropic = model.provider_type() == crate::model::ProviderType::Anthropic;
-    }
-    state.ready = true;
-    state.resolved_model_id = model_id.into();
-    state.conversation_id = if request.conversation_id.is_empty() {
+    let model_id = requested.model_id.trim();
+    let config = configured_model(store, model_id).await?;
+    let mut model = InferenceModel::new(model_id, config.as_ref());
+    model.select(requested)?;
+    let conversation_id = if request.conversation_id.is_empty() {
         request_id.into()
     } else {
         request.conversation_id.clone()
     };
-    let prompt_model_metadata = convert::prompt_metadata(model_id, model_config.as_ref());
+    let prompt_model_metadata = convert::prompt_metadata(&model.spec, config.as_ref());
     handle.trace().response_started(200);
     handle.emit(&convert::run_ready(
-        model_id,
-        model_config
-            .as_ref()
-            .map(|model| model.display_name.as_str()),
+        requested.clone(),
+        model.spec.display_name.as_deref(),
         prompt_model_metadata,
     ));
     tracing::info!(
         request_id,
         model_id,
-        conversation_id = %state.conversation_id,
+        conversation_id,
         "RunInference session ready"
     );
-    Ok(())
+    Ok(PreparedSession {
+        conversation_id,
+        model,
+    })
 }
 
 async fn run_invocation(
-    invocation_id: String,
+    events: InvocationEvents,
     model_id: String,
+    context_window: Option<u64>,
+    estimated_input: u64,
     mut stream: ProviderStream,
-    events: mpsc::Sender<SessionEvent>,
     thinking: Arc<convert::ThinkingTextCache>,
 ) {
     let mut calls = BTreeMap::<usize, PendingToolCall>::new();
@@ -564,6 +539,7 @@ async fn run_invocation(
         tool_calls: Vec::new(),
         reasoning_parts: Vec::new(),
     };
+    let mut usage_reported = false;
     let error = loop {
         let Some(event) = stream.next().await else {
             break Some(("provider stream ended without completion".to_owned(), 13));
@@ -571,23 +547,10 @@ async fn run_invocation(
         match event {
             Ok(ModelEvent::TextDelta(text)) => {
                 output.text.push_str(&text);
-                send_frame(
-                    &events,
-                    &invocation_id,
-                    convert::invocation_response(&invocation_id, convert::text_part(text, false)),
-                )
-                .await;
+                events.respond(convert::text_part(text, false)).await;
             }
             Ok(ModelEvent::ThinkingDelta(text)) => {
-                send_frame(
-                    &events,
-                    &invocation_id,
-                    convert::invocation_response(
-                        &invocation_id,
-                        convert::thinking_part(text, false),
-                    ),
-                )
-                .await;
+                events.respond(convert::thinking_part(text, false)).await;
             }
             Ok(ModelEvent::ThinkingEnd) => {
                 // Do not emit an empty final thinking part: Cursor would start
@@ -599,15 +562,9 @@ async fn run_invocation(
                 call_id,
                 name,
             }) => {
-                send_frame(
-                    &events,
-                    &invocation_id,
-                    convert::invocation_response(
-                        &invocation_id,
-                        convert::tool_call_start(&call_id, &name, index),
-                    ),
-                )
-                .await;
+                events
+                    .respond(convert::tool_call_start(&call_id, &name, index))
+                    .await;
                 calls.insert(
                     index,
                     PendingToolCall {
@@ -620,15 +577,9 @@ async fn run_invocation(
             Ok(ModelEvent::ToolCallArgumentsDelta { index, delta }) => {
                 if let Some(call) = calls.get_mut(&index) {
                     call.arguments.push_str(&delta);
-                    send_frame(
-                        &events,
-                        &invocation_id,
-                        convert::invocation_response(
-                            &invocation_id,
-                            convert::tool_call_delta(&call.call_id, &delta, index),
-                        ),
-                    )
-                    .await;
+                    events
+                        .respond(convert::tool_call_delta(&call.call_id, &delta, index))
+                        .await;
                 }
             }
             Ok(ModelEvent::ToolCallEnd { index }) => {
@@ -644,19 +595,24 @@ async fn run_invocation(
                         &call.name,
                         &arguments,
                     ));
-                    send_frame(
-                        &events,
-                        &invocation_id,
-                        convert::invocation_response(
-                            &invocation_id,
-                            convert::tool_call_part(&call.call_id, &call.name, &arguments, index),
-                        ),
-                    )
-                    .await;
+                    events
+                        .respond(convert::tool_call_part(
+                            &call.call_id,
+                            &call.name,
+                            &arguments,
+                            index,
+                        ))
+                        .await;
                 }
             }
-            Ok(ModelEvent::Usage(usage)) => {
-                emit_usage(&events, &invocation_id, &usage).await;
+            Ok(ModelEvent::Usage(mut usage)) => {
+                if usage.context_input_tokens.is_none() && usage.total_tokens.is_none() {
+                    usage.context_input_tokens = usage.input_tokens.or(Some(estimated_input));
+                }
+                for part in convert::usage_parts(&usage, context_window) {
+                    events.respond(part).await;
+                }
+                usage_reported = true;
             }
             Ok(ModelEvent::Done(_)) => break None,
             Ok(ModelEvent::ProviderReplayState(state)) => {
@@ -679,9 +635,8 @@ async fn run_invocation(
                     }
                 }
                 if state.provider_kind == "openai_responses" {
-                    let _ = events
+                    events
                         .send(SessionEvent::Replay {
-                            invocation_id: invocation_id.clone(),
                             call_ids: tool_call_ids.clone(),
                             state: state.clone(),
                         })
@@ -691,12 +646,7 @@ async fn run_invocation(
                     .reasoning_parts
                     .extend(convert::reasoning_parts_from_state(&state));
                 for part in convert::replay_parts(&state) {
-                    send_frame(
-                        &events,
-                        &invocation_id,
-                        convert::invocation_response(&invocation_id, part),
-                    )
-                    .await;
+                    events.respond(part).await;
                 }
             }
             Ok(
@@ -708,31 +658,30 @@ async fn run_invocation(
             Err(error) => break Some((error.to_string(), error_code(&error))),
         }
     };
-    if error.is_none() {
-        if let Some(part) = convert::response_info(&invocation_id, &model_id, &output) {
-            send_frame(
-                &events,
-                &invocation_id,
-                convert::invocation_response(&invocation_id, part),
-            )
-            .await;
+    if let Some((message, code)) = error {
+        if crate::run::is_context_overflow(&message) {
+            events.respond(convert::input_token_limit(message)).await;
+            events.send(SessionEvent::End(None)).await;
+        } else {
+            events.send(SessionEvent::End(Some((code, message)))).await;
         }
-        // Cursor's AI SDK treats `textPart.isFinal` as the end of the model
-        // step, so it must be emitted exactly once after all text and tool
-        // parts, never at an intermediate text block boundary.
-        send_frame(
-            &events,
-            &invocation_id,
-            convert::invocation_response(&invocation_id, convert::text_part("", true)),
-        )
-        .await;
+        return;
     }
-    let _ = events
-        .send(SessionEvent::End {
-            invocation_id,
-            error: error.map(|(message, code)| (code, message)),
-        })
-        .await;
+    if !usage_reported && context_window.is_some() {
+        let usage = Usage {
+            context_input_tokens: Some(estimated_input),
+            ..Default::default()
+        };
+        for part in convert::usage_parts(&usage, context_window) {
+            events.respond(part).await;
+        }
+    }
+    if let Some(part) = convert::response_info(&events.invocation_id, &model_id, &output) {
+        events.respond(part).await;
+    }
+    // The local loop completes the model step on the final text part.
+    events.respond(convert::text_part("", true)).await;
+    events.send(SessionEvent::End(None)).await;
 }
 
 struct PendingToolCall {
@@ -741,41 +690,48 @@ struct PendingToolCall {
     arguments: String,
 }
 
-async fn send_frame(
-    events: &mpsc::Sender<SessionEvent>,
-    invocation_id: &str,
-    message: RunInferenceServerMessage,
-) {
-    let _ = events
-        .send(SessionEvent::Frame {
-            invocation_id: invocation_id.into(),
-            message: Box::new(message),
-        })
-        .await;
-}
-
-async fn emit_usage(events: &mpsc::Sender<SessionEvent>, invocation_id: &str, usage: &Usage) {
-    for part in convert::usage_parts(usage) {
-        send_frame(
-            events,
-            invocation_id,
-            convert::invocation_response(invocation_id, part),
-        )
-        .await;
-    }
-}
-
-fn stop_active(active: &mut Option<ActiveInvocation>, handle: &InferenceHandle, notify: bool) {
-    let Some(active) = active.take() else {
-        return;
-    };
-    active.cancellation.cancel();
-    active.task.abort();
-    if notify {
-        handle.emit(&convert::invocation_end(
-            &active.invocation_id,
-            Some((1, "Invocation canceled".into())),
+impl ActiveInvocation {
+    fn start(
+        invocation: ModelInvocation,
+        output: InvocationEvents,
+        handle: &InferenceHandle,
+        provider: &dyn Provider,
+        thinking: Arc<convert::ThinkingTextCache>,
+    ) -> Option<Self> {
+        let request = &invocation.request;
+        let model_id = request.model.model_id.clone();
+        let window = request.model.context_window_tokens;
+        let estimate = estimate_context_tokens(&request.prompt, &request.history);
+        if let Some(limit) = window.filter(|limit| estimate > *limit) {
+            let part = convert::input_token_limit(format!(
+                "Estimated input of {estimate} tokens exceeds the selected context window of {limit} tokens"
+            ));
+            handle.emit(&convert::invocation_response(&output.invocation_id, part));
+            handle.emit(&convert::invocation_end(&output.invocation_id, None));
+            return None;
+        }
+        let invocation_id = output.invocation_id.clone();
+        let cancellation = CancellationToken::new();
+        let stream = provider.stream(invocation, cancellation.clone());
+        let task = tokio::spawn(run_invocation(
+            output, model_id, window, estimate, stream, thinking,
         ));
+        Some(Self {
+            invocation_id,
+            cancellation,
+            task,
+        })
+    }
+
+    fn stop(&self, handle: &InferenceHandle, notify: bool) {
+        self.cancellation.cancel();
+        self.task.abort();
+        if notify {
+            handle.emit(&convert::invocation_end(
+                &self.invocation_id,
+                Some((1, "Invocation canceled".into())),
+            ));
+        }
     }
 }
 

@@ -80,23 +80,22 @@ fn from_requested(
     model: &pb::RequestedModel,
     details: Option<&pb::ModelDetails>,
 ) -> Result<ModelSpec> {
-    let mut spec = ModelSpec {
-        model_id: model.model_id.clone(),
-        display_name: details
-            .map(|model| model.display_name.clone())
-            .filter(|name| !name.is_empty()),
-        reasoning: ReasoningSpec {
-            enabled: model.max_mode
-                || details.is_some_and(|model| model.thinking_details.is_some()),
-            effort: None,
-        },
-        latency: ModelLatency::Standard,
-        max_output_tokens: None,
-        context_window_tokens: None,
-        supports_image_generation: false,
-        extra_params: serde_json::json!({}),
-    };
-    for parameter in &model.parameters {
+    let mut spec = ModelSpec::new(&model.model_id);
+    spec.display_name = details
+        .map(|model| model.display_name.clone())
+        .filter(|name| !name.is_empty());
+    spec.reasoning.enabled = details.is_some_and(|model| model.thinking_details.is_some());
+    apply_model_parameters(&mut spec, model.max_mode, &model.parameters)?;
+    Ok(spec)
+}
+
+pub(crate) fn apply_model_parameters(
+    spec: &mut ModelSpec,
+    max_mode: bool,
+    parameters: &[pb::requested_model::ModelParameterValue],
+) -> Result<()> {
+    spec.reasoning.enabled |= max_mode;
+    for parameter in parameters {
         match parameter.id.as_str() {
             "effort" | "reasoning" => {
                 let effort = parameter.value.trim();
@@ -106,23 +105,28 @@ fn from_requested(
             }
             "thinking" => spec.reasoning.enabled |= parse_bool(parameter)?,
             "fast" => {
-                if parse_bool(parameter)? {
-                    spec.latency = ModelLatency::Fast;
-                }
+                spec.latency = if parse_bool(parameter)? {
+                    ModelLatency::Fast
+                } else {
+                    ModelLatency::Standard
+                };
             }
             "context" => {
-                spec.context_window_tokens =
-                    Some(parse_token_count(&parameter.value).ok_or_else(|| {
-                        Error::Protocol(format!(
-                            "invalid Cursor context token count: {}",
-                            parameter.value
-                        ))
-                    })?);
+                spec.context_window_tokens = Some(
+                    parse_token_count(&parameter.value)
+                        .filter(|tokens| *tokens > 0)
+                        .ok_or_else(|| {
+                            Error::Protocol(format!(
+                                "invalid Cursor context token count: {}",
+                                parameter.value
+                            ))
+                        })?,
+                );
             }
             _ => {}
         }
     }
-    Ok(spec)
+    Ok(())
 }
 
 fn parse_bool(parameter: &pb::requested_model::ModelParameterValue) -> Result<bool> {

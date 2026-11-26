@@ -6,6 +6,7 @@
 //! message families apart before routing.
 
 mod convert;
+mod model;
 mod session;
 pub mod stream;
 pub mod wire;

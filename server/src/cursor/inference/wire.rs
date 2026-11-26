@@ -311,13 +311,7 @@ pub struct InferenceRequestedModel {
     pub built_in_model: bool,
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct InferenceModelParameterValue {
-    #[prost(string, tag = "1")]
-    pub id: String,
-    #[prost(string, tag = "2")]
-    pub value: String,
-}
+pub use crate::cursor::protocol::proto::agent::v1::requested_model::ModelParameterValue as InferenceModelParameterValue;
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InferenceStreamRequest {
@@ -599,4 +593,6 @@ pub struct InferenceExtendedUsageInfo {
 pub struct InferenceStreamError {
     #[prost(string, tag = "1")]
     pub message: String,
+    #[prost(bool, tag = "3")]
+    pub is_input_token_limit_error: bool,
 }

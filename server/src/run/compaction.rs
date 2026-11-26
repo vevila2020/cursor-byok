@@ -39,7 +39,7 @@ pub(super) fn input_budget(prepared: &PreparedRun) -> Option<u64> {
 /// Providers report this as a plain 400 with prose, so there is nothing
 /// structured to match on. Anthropic says "prompt is too long"; OpenAI-style
 /// gateways use `context_length_exceeded` or "maximum context length".
-pub(super) fn is_context_overflow(message: &str) -> bool {
+pub(crate) fn is_context_overflow(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
     lowered.contains("prompt is too long")
         || lowered.contains("context window exceeded")
