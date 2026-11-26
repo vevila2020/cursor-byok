@@ -18,6 +18,8 @@ pub enum ProviderType {
     OpenAiResponses,
     #[serde(rename = "anthropic")]
     Anthropic,
+    #[serde(rename = "gemini")]
+    Gemini,
     /// 插件执行的调用;协议细节在插件内部,核心只按统一事件流记录。
     #[serde(rename = "plugin")]
     Plugin,
@@ -29,6 +31,7 @@ impl ProviderType {
             Self::OpenAiChat => "openai-chat",
             Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
             Self::Plugin => "plugin",
         }
     }
@@ -48,6 +51,7 @@ impl FromStr for ProviderType {
             "openai-chat" => Ok(Self::OpenAiChat),
             "openai-responses" => Ok(Self::OpenAiResponses),
             "anthropic" => Ok(Self::Anthropic),
+            "gemini" => Ok(Self::Gemini),
             "plugin" => Ok(Self::Plugin),
             _ => Err(Error::Config(format!("unsupported provider type: {value}"))),
         }
@@ -59,6 +63,7 @@ impl FromStr for ProviderType {
 pub enum ModelType {
     OpenAi,
     Anthropic,
+    Gemini,
 }
 
 impl ModelType {
@@ -66,6 +71,7 @@ impl ModelType {
         match self {
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -77,6 +83,7 @@ impl FromStr for ModelType {
         match value {
             "openai" => Ok(Self::OpenAi),
             "anthropic" => Ok(Self::Anthropic),
+            "gemini" => Ok(Self::Gemini),
             _ => Err(Error::Config(format!("unsupported model type: {value}"))),
         }
     }
@@ -156,6 +163,7 @@ impl ModelConfig {
     pub fn provider_type(&self) -> ProviderType {
         match self.model_type {
             ModelType::Anthropic => ProviderType::Anthropic,
+            ModelType::Gemini => ProviderType::Gemini,
             ModelType::OpenAi if self.openai_endpoint == OPENAI_RESPONSES_ENDPOINT => {
                 ProviderType::OpenAiResponses
             }
@@ -167,6 +175,7 @@ impl ModelConfig {
         resolve_request_url(
             self.model_type,
             &self.base_url,
+            &self.model_id,
             &self.openai_endpoint,
             self.use_full_url,
         )
@@ -174,13 +183,14 @@ impl ModelConfig {
 
     pub fn max_output_tokens(&self) -> Option<u64> {
         match self.model_type {
-            ModelType::OpenAi => self.max_completion_tokens,
+            ModelType::OpenAi | ModelType::Gemini => self.max_completion_tokens,
             ModelType::Anthropic => self.anthropic_max_tokens.or(self.max_completion_tokens),
         }
     }
 
     pub fn default_effort(&self) -> Option<&str> {
         match self.model_type {
+            ModelType::Gemini => None,
             ModelType::OpenAi => self.reasoning_effort.as_deref(),
             ModelType::Anthropic => self.anthropic_thinking_effort.as_deref(),
         }
@@ -222,6 +232,11 @@ pub fn normalize_model_input(input: &ModelConfigInput) -> Result<ModelConfigInpu
     let api_key = required(&input.api_key, "model API key")?;
     let tooltip_data = required(&input.tooltip_data, "model tooltip")?;
     let model_id = required(&input.model_id, "model id")?;
+    let model_id = if input.model_type == ModelType::Gemini {
+        gemini_model_id(&model_id)?.to_owned()
+    } else {
+        model_id
+    };
     let reasoning_effort = normalize_effort(input.reasoning_effort.as_deref(), true)?;
     let anthropic_thinking_effort = match input.model_type {
         ModelType::Anthropic => Some(
@@ -231,11 +246,11 @@ pub fn normalize_model_input(input: &ModelConfigInput) -> Result<ModelConfigInpu
             )?
             .expect("Anthropic effort has a default"),
         ),
-        ModelType::OpenAi => None,
+        ModelType::OpenAi | ModelType::Gemini => None,
     };
     let openai_endpoint = match input.model_type {
         ModelType::OpenAi => normalize_openai_endpoint(&input.openai_endpoint)?,
-        ModelType::Anthropic => String::new(),
+        ModelType::Anthropic | ModelType::Gemini => String::new(),
     };
     validate_object(&input.openai_extra_params, "OpenAI extra params")?;
     validate_object(&input.anthropic_extra_params, "Anthropic extra params")?;
@@ -280,6 +295,7 @@ pub fn normalize_model_input(input: &ModelConfigInput) -> Result<ModelConfigInpu
     resolve_request_url(
         normalized.model_type,
         &normalized.base_url,
+        &normalized.model_id,
         &normalized.openai_endpoint,
         normalized.use_full_url,
     )?;
@@ -291,6 +307,7 @@ pub fn model_hash(input: &ModelConfigInput) -> Result<String> {
     let request_url = resolve_request_url(
         normalized.model_type,
         &normalized.base_url,
+        &normalized.model_id,
         &normalized.openai_endpoint,
         normalized.use_full_url,
     )?;
@@ -302,6 +319,9 @@ pub fn model_hash(input: &ModelConfigInput) -> Result<String> {
     ];
     if normalized.model_type == ModelType::OpenAi {
         parts.push(normalized.openai_endpoint);
+    }
+    if normalized.model_type == ModelType::Gemini {
+        parts.push("gemini".into());
     }
     let digest = Sha256::digest(parts.join("\n").as_bytes());
     Ok(hex::encode(&digest[..8]))
@@ -327,6 +347,7 @@ pub fn normalize_request_url(value: &str) -> Result<String> {
 pub fn resolve_request_url(
     model_type: ModelType,
     base_url: &str,
+    model_id: &str,
     openai_endpoint: &str,
     use_full_url: bool,
 ) -> Result<String> {
@@ -334,11 +355,73 @@ pub fn resolve_request_url(
     let endpoint = match model_type {
         ModelType::OpenAi => normalize_openai_endpoint(openai_endpoint)?,
         ModelType::Anthropic => "/v1/messages".into(),
+        ModelType::Gemini => return gemini_request_url(&base_url, model_id, use_full_url),
     };
     if use_full_url {
         return Ok(base_url);
     }
     append_standard_endpoint(&base_url, &endpoint)
+}
+
+fn gemini_model_id(value: &str) -> Result<&str> {
+    let id = value.strip_prefix("models/").unwrap_or(value);
+    if id.is_empty() || id == "." || id == ".." || id.contains(['/', '?', '#', ':']) {
+        return Err(Error::Config(
+            "expected a Gemini model ID such as gemini-2.5-flash".into(),
+        ));
+    }
+    Ok(id)
+}
+
+pub fn gemini_models_url(base_url: &str) -> Result<Url> {
+    let mut url = Url::parse(&normalize_request_url(base_url)?).expect("validated URL");
+    let path = url.path().trim_end_matches('/');
+    let path = if let Some((parent, _)) = path
+        .rsplit_once("/models/")
+        .filter(|(_, tail)| tail.ends_with(":streamGenerateContent"))
+    {
+        format!("{parent}/models")
+    } else if path.ends_with("/v1beta/models") {
+        path.to_owned()
+    } else if path.ends_with("/v1beta") {
+        format!("{path}/models")
+    } else {
+        format!("{path}/v1beta/models")
+    };
+    url.set_path(&path);
+    let params: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "alt" && key != "pageToken")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    url.set_query(None);
+    if !params.is_empty() {
+        url.query_pairs_mut().extend_pairs(params);
+    }
+    Ok(url)
+}
+
+fn gemini_request_url(base_url: &str, model_id: &str, full: bool) -> Result<String> {
+    let id = gemini_model_id(model_id)?;
+    if full {
+        let url = Url::parse(base_url).expect("validated URL");
+        if !url
+            .path()
+            .ends_with(&format!("/models/{id}:streamGenerateContent"))
+            || !url
+                .query_pairs()
+                .any(|(key, value)| key == "alt" && value == "sse")
+        {
+            return Err(Error::Config("Gemini full URL must end in /models/{model_id}:streamGenerateContent?alt=sse; use server address mode for /v1beta/models".into()));
+        }
+        return Ok(base_url.into());
+    }
+    let mut url = gemini_models_url(base_url)?;
+    url.path_segments_mut()
+        .expect("validated HTTP URL")
+        .push(&format!("{id}:streamGenerateContent"));
+    url.query_pairs_mut().append_pair("alt", "sse");
+    Ok(url.into())
 }
 
 fn append_standard_endpoint(base_url: &str, endpoint: &str) -> Result<String> {
@@ -366,7 +449,13 @@ fn has_trailing_version(path: &str) -> bool {
 pub fn is_sensitive_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "authorization" | "proxy-authorization" | "x-api-key" | "api-key" | "cookie" | "set-cookie"
+        "authorization"
+            | "proxy-authorization"
+            | "x-goog-api-key"
+            | "x-api-key"
+            | "api-key"
+            | "cookie"
+            | "set-cookie"
     )
 }
 

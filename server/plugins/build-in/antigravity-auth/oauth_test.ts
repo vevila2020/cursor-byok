@@ -1,4 +1,4 @@
-import type { PluginContext } from "cursor-byok:plugin";
+import type { NetworkRequestInit, PluginContext } from "cursor-byok:plugin";
 import { antigravityAuthorizationCodeOAuth } from "./oauth.ts";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -8,7 +8,7 @@ function assert(condition: unknown, message: string): asserts condition {
 function context(requests: Array<{ url: string; body?: string }>): PluginContext {
   return {
     network: {
-      fetch: async (url, init = {}) => {
+      fetch: async (url: string, init: NetworkRequestInit = {}) => {
         requests.push({ url, body: init.body });
         if (url === "https://oauth2.googleapis.com/token") {
           return {

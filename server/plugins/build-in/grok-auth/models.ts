@@ -1,5 +1,6 @@
-import type { ModelDefinition, ModelSupport } from "cursor-byok:model";
-import { accountData } from "./resources.ts";
+import type { ModelDefinition, ModelListInput, ModelSupport } from "cursor-byok:model";
+import type { PluginContext } from "cursor-byok:plugin";
+import { accountData, accountHeaders } from "./resources.ts";
 
 const LANGUAGE_MODELS_URL = "https://api.x.ai/v1/language-models";
 const MODELS_URL = "https://api.x.ai/v1/models";
@@ -69,17 +70,24 @@ export function parseGrokModels(body: unknown): ModelDefinition[] {
 }
 
 export const grokModels: ModelSupport = {
-  list: async ({ resource }, context): Promise<ModelDefinition[]> => {
+  refreshResourceBeforeList: true,
+  list: async (
+    { resource }: ModelListInput,
+    context: PluginContext,
+  ): Promise<ModelDefinition[]> => {
     if (!resource) throw new Error("add a Grok account before syncing models");
     const data = accountData(resource);
-    const headers = {
-      accept: "application/json",
-      authorization: `Bearer ${data.accessToken}`,
-    };
+    const headers = accountHeaders(data);
     // language-models 带模态与上下文元数据;不可用时回退到标准列表。
     let response = await context.network.fetch(LANGUAGE_MODELS_URL, { method: "GET", headers });
     if (response.status < 200 || response.status >= 300) {
+      if (response.status === 401) {
+        throw new Error("Grok model discovery authorization failed (HTTP 401)");
+      }
       response = await context.network.fetch(MODELS_URL, { method: "GET", headers });
+    }
+    if (response.status === 401) {
+      throw new Error("Grok model discovery authorization failed (HTTP 401)");
     }
     if (response.status < 200 || response.status >= 300) {
       return FALLBACK_MODELS;

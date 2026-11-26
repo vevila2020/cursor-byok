@@ -12,6 +12,7 @@ import { LegacyModelImport } from "./LegacyModelImport";
 import { ConfirmDialog } from "../../shared/ui/ConfirmDialog";
 import { FormField, SecretTextInput, TextInput } from "../../shared/ui/FormControls";
 import controls from "../../shared/ui/Controls.module.scss";
+import { Button } from "../../shared/ui/Button";
 import { Icon } from "../../shared/ui/Icon";
 import { Modal } from "../../shared/ui/Modal";
 import { Switch } from "../../shared/ui/Switch";
@@ -41,7 +42,6 @@ export function CursorSettingsPage() {
   const [settingsGroup, setSettingsGroup] = useState<CursorModelGroup | null>(null);
   const [groupNameDraft, setGroupNameDraft] = useState("");
   const [groupBaseUrlDraft, setGroupBaseUrlDraft] = useState("");
-  const [groupUseBaseUrl, setGroupUseBaseUrl] = useState(false);
   const [groupApiKeyDraft, setGroupApiKeyDraft] = useState("");
   const [groupSettingsBusy, setGroupSettingsBusy] = useState(false);
   const activeModelTests = useRef(new Map<string, { testId: string; controller: AbortController; cancelling: boolean }>());
@@ -227,7 +227,6 @@ export function CursorSettingsPage() {
   const openGroupSettings = (group: CursorModelGroup) => {
     setGroupNameDraft(group.models.find((model) => model.group_name?.trim())?.group_name?.trim() ?? "");
     setGroupBaseUrlDraft(sharedValue(group.models.map((model) => model.base_url)) ?? "");
-    setGroupUseBaseUrl(false);
     setGroupApiKeyDraft(sharedValue(group.models.map((model) => model.api_key)) ?? "");
     setSettingsGroup(group);
   };
@@ -243,7 +242,6 @@ export function CursorSettingsPage() {
           ...modelInput(model),
           group_name,
           ...(base_url ? { base_url } : {}),
-          ...(base_url && groupUseBaseUrl ? { use_full_url: false } : {}),
           ...(api_key ? { api_key } : {}),
         };
         if (input.group_name === (model.group_name ?? null)
@@ -310,31 +308,37 @@ export function CursorSettingsPage() {
 
   return <>
     <PageActions position="left">
-      <div className={styles.takeoverActions}>
-        <TooltipTrigger label={cursorTakenOver ? t("启动 Cursor") : t("开启接管后可启动 Cursor")}>
-          <button type="button" className={styles.launchButton} disabled={cursorBusy || !cursorTakenOver} onClick={() => void launchCursor()}>{t("启动 Cursor")}</button>
-        </TooltipTrigger>
-        <span className={styles.takeoverStatus}>{cursorTakenOver ? t("已接管") : t("未接管")}</span>
-        <TooltipTrigger label={takeoverLabel}>
-          <Switch
-            checked={cursorTakenOver}
-            disabled={cursorBusy || (!cursorTakenOver && !caReady)}
-            label={takeoverLabel}
-            onChange={(enabled) => {
-              if (enabled) void appStore.setCursorEnabled(true);
-              else setConfirmDisableTakeover(true);
-            }}
-          />
-        </TooltipTrigger>
-        {testTargets.length > 0 && <div className={styles.groupActions} role="group" aria-label={t("操作")}>
-          <button type="button" aria-pressed={grouping === "flat"} onClick={() => setGrouping("flat")}>{t("默认平铺")}</button>
-          {canGroupByProvider && <button type="button" aria-pressed={grouping === "provider"} onClick={() => setGrouping("provider")}>{t("按供应商")}</button>}
-          {canGroupByType && <button type="button" aria-pressed={grouping === "type"} onClick={() => setGrouping("type")}>{t("按类型")}</button>}
-          <button type="button" disabled={cursorBusy || (!batchTesting && testingModelHashes.size > 0)} onClick={() => void (batchTesting ? cancelAllModelTests() : testAllModels())}>{batchTesting ? t("取消全部测试") : t("一键测试")}</button>
+      <div className={styles.pageToolbar}>
+        <div className={styles.takeoverActions}>
+          <span className={styles.takeoverStatus} data-taken={cursorTakenOver || undefined}>{cursorTakenOver ? t("已接管") : t("未接管")}</span>
+          <TooltipTrigger label={takeoverLabel}>
+            <Switch
+              checked={cursorTakenOver}
+              disabled={cursorBusy || (!cursorTakenOver && !caReady)}
+              label={takeoverLabel}
+              onChange={(enabled) => {
+                if (enabled) void appStore.setCursorEnabled(true);
+                else setConfirmDisableTakeover(true);
+              }}
+            />
+          </TooltipTrigger>
+        </div>
+        {testTargets.length > 0 && <div className={styles.pageTools}>
+          <div className={styles.groupActions} role="group" aria-label={t("操作")}>
+            <button type="button" aria-pressed={grouping === "flat"} onClick={() => setGrouping("flat")}>{t("默认平铺")}</button>
+            {canGroupByProvider && <button type="button" aria-pressed={grouping === "provider"} onClick={() => setGrouping("provider")}>{t("按供应商")}</button>}
+            {canGroupByType && <button type="button" aria-pressed={grouping === "type"} onClick={() => setGrouping("type")}>{t("按类型")}</button>}
+          </div>
+          <Button variant="secondary" size="small" disabled={cursorBusy || (!batchTesting && testingModelHashes.size > 0)} onClick={() => void (batchTesting ? cancelAllModelTests() : testAllModels())}>{batchTesting ? t("取消全部测试") : t("一键测试")}</Button>
         </div>}
       </div>
     </PageActions>
-    <PageActions><TooltipTrigger label={caReady ? t("添加模型") : t("请先初始化 CA")}><button className={controls.iconButton} aria-label={t("添加模型")} disabled={!caReady || cursorBusy} onClick={openNew}><Icon icon={addIcon} size="1.1em" /></button></TooltipTrigger></PageActions>
+    <PageActions>
+      <TooltipTrigger label={cursorTakenOver ? t("启动 Cursor") : t("开启接管后可启动 Cursor")}>
+        <Button variant="primary" size="small" className={styles.launchButton} disabled={cursorBusy || !cursorTakenOver} onClick={() => void launchCursor()}><span className={styles.launchLabel}>{t("启动 Cursor")}</span></Button>
+      </TooltipTrigger>
+      <TooltipTrigger label={caReady ? t("添加模型") : t("请先初始化 CA")}><button className={controls.iconButton} aria-label={t("添加模型")} disabled={!caReady || cursorBusy} onClick={openNew}><Icon icon={addIcon} size="1.1em" /></button></TooltipTrigger>
+    </PageActions>
     <PageContent title="Cursor" sections={[{ key: "cursor-settings", estimatedHeight: estimatedModelHeight, content }]} />
     <ConfirmDialog
       open={confirmDisableTakeover}
@@ -363,12 +367,12 @@ export function CursorSettingsPage() {
           <TextInput placeholder={settingsGroup.key} value={groupNameDraft} onChange={(event) => setGroupNameDraft(event.target.value)} />
         </FormField>
         <FormField label={t("服务器地址")} hint={t("修改后应用于该分组下的全部模型；留空保持各模型现有配置不变。")}>
-          <TextInput placeholder={t("留空保持不变")} value={groupBaseUrlDraft} onChange={(event) => { setGroupBaseUrlDraft(event.target.value); setGroupUseBaseUrl(false); }} />
+          <TextInput placeholder={t("留空保持不变")} value={groupBaseUrlDraft} onChange={(event) => setGroupBaseUrlDraft(event.target.value)} />
         </FormField>
-        <EliasApiActions onApply={(baseUrl) => { setGroupBaseUrlDraft(baseUrl); setGroupUseBaseUrl(true); }} />
         <FormField label="API Key" hint={t("修改后应用于该分组下的全部模型；留空保持各模型现有配置不变。")}>
           <SecretTextInput placeholder={t("留空保持不变")} autoComplete="off" value={groupApiKeyDraft} onChange={(event) => setGroupApiKeyDraft(event.target.value)} />
         </FormField>
+        <EliasApiActions />
       </div>}
     </Modal>
     <ConfirmDialog open={deleting !== null} title={t("删除模型")} cancelLabel={t("取消")} confirmLabel={t("删除")} onCancel={() => setDeleting(null)} onConfirm={() => { if (deleting) void appStore.deleteModel(deleting.model_hash); setDeleting(null); }}><p>{t("确定删除这个模型吗？")}</p></ConfirmDialog>
@@ -400,7 +404,7 @@ function draftInput(draft: CursorModelDraft): ModelInput {
     anthropic_extra_params: parseObject(draft.anthropicExtraParamsText, t("Anthropic 额外参数")),
   };
   if (!model.display_name || !model.base_url || !model.api_key || !model.tooltip_data || !model.model_id) throw new Error(t("服务器地址或完整请求 URL、API Key、模型名称、显示名称和备注不能为空"));
-  for (const [label, value] of [[t("上下文窗口 Token"), model.context_window_tokens], [t("最大输出 Token"), model.type === "openai" ? model.max_completion_tokens : model.anthropic_max_tokens], [t("思考预算 Token"), model.thinking_budget_tokens]] as const) {
+  for (const [label, value] of [[t("上下文窗口 Token"), model.context_window_tokens], [t("最大输出 Token"), model.type === "anthropic" ? model.anthropic_max_tokens : model.max_completion_tokens], [t("思考预算 Token"), model.thinking_budget_tokens]] as const) {
     if (value !== null && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(t("{label} 必须是大于 0 的整数", { label }));
   }
   return model;

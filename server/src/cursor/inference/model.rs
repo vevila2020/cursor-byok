@@ -1,7 +1,7 @@
 //! Resolves the model and picker parameters for each local-loop invocation.
 use crate::{
     cursor::compile::apply_model_parameters,
-    model::{ModelConfig, ModelSpec, ModelType},
+    model::{ModelConfig, ModelSpec, ProviderType},
     store::Store,
     Error, Result,
 };
@@ -22,7 +22,7 @@ pub(super) async fn configured_model(store: &Store, id: &str) -> Result<Option<M
 #[derive(Clone)]
 pub(super) struct InferenceModel {
     pub spec: ModelSpec,
-    pub is_anthropic: bool,
+    pub provider_type: Option<ProviderType>,
 }
 
 impl InferenceModel {
@@ -33,7 +33,7 @@ impl InferenceModel {
         }
         Self {
             spec,
-            is_anthropic: config.is_some_and(|config| config.model_type == ModelType::Anthropic),
+            provider_type: config.map(ModelConfig::provider_type),
         }
     }
 

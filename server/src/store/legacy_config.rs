@@ -201,6 +201,9 @@ fn legacy_request_configuration(
 ) -> Result<(String, String, bool)> {
     let base_url = normalize_request_url(base_url)?;
     match model_type {
+        ModelType::Gemini => Err(Error::Config(
+            "v0.0.49 did not support native Gemini".into(),
+        )),
         ModelType::Anthropic => {
             let use_full_url = url_path_ends_with(&base_url, "/messages");
             Ok((base_url, String::new(), use_full_url))

@@ -3,6 +3,8 @@
 mod fake_provider;
 #[path = "support/fixtures.rs"]
 mod fixtures;
+#[path = "support/gemini.rs"]
+mod gemini;
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -1036,12 +1038,91 @@ async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
         Arc::new(provider.clone()),
         PromptCompiler::new(assets),
     );
+    complete_read_round(registry, client_run()).await;
+    assert_eq!(provider.requests().len(), 2);
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        directory.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    let provider_call_index: i64 =
+        sqlx::query_scalar("SELECT provider_call_index FROM runs WHERE cursor_request_id = ?")
+            .bind("tool-request")
+            .fetch_one(&database)
+            .await
+            .unwrap();
+    assert_eq!(provider_call_index, 1);
+    let messages = store
+        .load_current_messages(&cursor_server::model::ConversationId::new(
+            "tool-conversation",
+        ))
+        .await
+        .unwrap();
+    let result_position = messages
+        .iter()
+        .position(|message| matches!(message.content, MessageContent::ToolResult(_)))
+        .expect("tool result persisted");
+    let MessageContent::Assistant { tool_calls, .. } = &messages[result_position - 1].content
+    else {
+        panic!("tool result must immediately follow its assistant tool call")
+    };
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].call_id, "call-1");
+}
+
+#[tokio::test]
+async fn gemini_server_tool_round_replays_native_signature_and_completes() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let part = json!({"functionCall":{"name":"Read","args":{"path":"/tmp/a"}}, "thoughtSignature":gemini::SIGNATURE});
+    let mut channel = gemini::channel(&store, vec![part.clone()]).await;
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = TransportRegistry::new(
+        store.clone(),
+        channel.provider.clone(),
+        PromptCompiler::new(assets),
+    );
+    complete_read_round(
+        registry,
+        client_run_for_model("gemini-history", "gemini-run", &channel.model.model_hash),
+    )
+    .await;
+    let first = channel.requests.try_recv().unwrap();
+    assert!(first
+        .pointer("/tools/0/functionDeclarations")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["name"] == "Read"));
+    let next = channel.requests.try_recv().unwrap();
+    let turns = next["contents"].as_array().unwrap();
+    assert_eq!(turns[turns.len() - 2]["parts"][1], part);
+    let result = &turns.last().unwrap()["parts"][0]["functionResponse"];
+    assert_eq!(result["name"], "Read");
+    assert!(result.get("id").is_none());
+    assert!(result["response"]["output"].as_str().unwrap().contains('x'));
+    let history = store
+        .load_current_messages(&cursor_server::model::ConversationId::new("gemini-history"))
+        .await
+        .unwrap();
+    assert!(history
+        .iter()
+        .any(|m| matches!(&m.content, MessageContent::Assistant {text,..} if text=="all done")));
+}
+
+async fn complete_read_round(registry: TransportRegistry, first: pb::AgentClientMessage) {
     let handle = registry.get_or_create("tool-request").await.unwrap();
     let mut output = handle.subscribe();
     handle
         .command(TransportCommand::Append {
             seqno: 0,
-            message: Box::new(client_run()),
+            message: Box::new(first),
         })
         .await
         .unwrap();
@@ -1154,36 +1235,6 @@ async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
     }
     assert!(saw_exec);
     assert!(saw_typed_completion);
-    assert_eq!(provider.requests().len(), 2);
-    let database = sqlx::SqlitePool::connect(&format!(
-        "sqlite://{}",
-        directory.path().join("test.db").display()
-    ))
-    .await
-    .unwrap();
-    let provider_call_index: i64 =
-        sqlx::query_scalar("SELECT provider_call_index FROM runs WHERE cursor_request_id = ?")
-            .bind("tool-request")
-            .fetch_one(&database)
-            .await
-            .unwrap();
-    assert_eq!(provider_call_index, 1);
-    let messages = store
-        .load_current_messages(&cursor_server::model::ConversationId::new(
-            "tool-conversation",
-        ))
-        .await
-        .unwrap();
-    let result_position = messages
-        .iter()
-        .position(|message| matches!(message.content, MessageContent::ToolResult(_)))
-        .expect("tool result persisted");
-    let MessageContent::Assistant { tool_calls, .. } = &messages[result_position - 1].content
-    else {
-        panic!("tool result must immediately follow its assistant tool call")
-    };
-    assert_eq!(tool_calls.len(), 1);
-    assert_eq!(tool_calls[0].call_id, "call-1");
 }
 
 fn tool_call_response(call_id: &str) -> Vec<ModelEvent> {

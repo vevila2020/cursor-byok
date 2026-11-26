@@ -12,6 +12,7 @@ mod protocol;
 mod registry;
 mod runtime;
 mod state;
+mod update;
 mod wire;
 mod worker;
 
@@ -21,6 +22,7 @@ pub use descriptor::{
 };
 pub use registry::{ImportResponse, OAuthBeginResponse, OAuthPollResponse, PluginRegistry};
 pub use runtime::{PluginRuntime, PluginRuntimePhase, PluginRuntimeState, PluginRuntimeStatus};
+pub use update::{PluginUpdateInfo, PluginUpdateStage};
 
 /// Windows 下阻止 Deno 子进程弹出控制台窗口(CREATE_NO_WINDOW)。
 #[cfg(windows)]

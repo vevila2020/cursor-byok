@@ -82,3 +82,7 @@ export async function checkForUpdate(): Promise<AppUpdate | null> {
 export async function installUpdate(update: AppUpdate): Promise<void> {
   await update.install();
 }
+
+export async function restartApp(): Promise<void> {
+  await relaunch();
+}

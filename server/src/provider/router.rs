@@ -261,6 +261,7 @@ fn provider_kind(provider_type: ProviderType) -> ProviderKind {
         ProviderType::OpenAiChat => ProviderKind::OpenAiChat,
         ProviderType::OpenAiResponses => ProviderKind::OpenAiResponses,
         ProviderType::Anthropic => ProviderKind::Anthropic,
+        ProviderType::Gemini => ProviderKind::Gemini,
         // 内置模型的 provider_type 只来自 ModelType,不可能是插件。
         ProviderType::Plugin => unreachable!("plugin models never use built-in provider configs"),
     }
@@ -359,6 +360,14 @@ fn build_inner(
         }
         ProviderKind::OpenAiResponses => {
             Arc::new(OpenAiResponsesProvider::new(client, config.clone()).with_recorder(recorder))
+        }
+        // Gemini tool call IDs must round-trip verbatim, even beyond 64 characters.
+        ProviderKind::Gemini => {
+            return Ok(Arc::new(super::gemini::GeminiProvider::new(
+                client,
+                config.clone(),
+                recorder,
+            )))
         }
         ProviderKind::Anthropic => {
             Arc::new(AnthropicProvider::new(client, config.clone()).with_recorder(recorder))

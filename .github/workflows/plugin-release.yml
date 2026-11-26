@@ -1,0 +1,104 @@
+name: Release built-in plugin
+
+on:
+  push:
+    tags:
+      - "plugin-*-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: plugin-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify release author and map tag
+        id: plugin
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          if [[ "${GITHUB_ACTOR}" != "${REPOSITORY_OWNER}" ]]; then
+            echo "Only ${REPOSITORY_OWNER} may publish plugin updates" >&2
+            exit 1
+          fi
+          case "${TAG}" in
+            plugin-codex-auth-v*) slug=codex-auth ;;
+            plugin-grok-auth-v*) slug=grok-auth ;;
+            plugin-antigravity-auth-v*) slug=antigravity-auth ;;
+            *) echo "Unsupported plugin release tag: ${TAG}" >&2; exit 1 ;;
+          esac
+          version="${TAG##*-v}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Plugin version must use MAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          manifest_version=$(node -p "require('./server/plugins/build-in/${slug}/plugin.json').version")
+          if [[ "${manifest_version}" != "${version}" ]]; then
+            echo "Tag version ${version} does not match plugin.json ${manifest_version}" >&2
+            exit 1
+          fi
+          echo "slug=${slug}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+
+      - name: Test plugin
+        shell: bash
+        run: |
+          deno test --config "server/plugins/build-in/${{ steps.plugin.outputs.slug }}/deno.json" \
+            "server/plugins/build-in/${{ steps.plugin.outputs.slug }}"
+
+      - name: Package plugin
+        env:
+          SLUG: ${{ steps.plugin.outputs.slug }}
+          VERSION: ${{ steps.plugin.outputs.version }}
+        run: |
+          python .github/scripts/package-plugin.py \
+            "server/plugins/build-in/${SLUG}" \
+            "dist/${SLUG}-${VERSION}.zip"
+
+      - name: Verify updater signing key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY is not configured" >&2
+            exit 1
+          fi
+
+      - name: Sign plugin package
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          SLUG: ${{ steps.plugin.outputs.slug }}
+          VERSION: ${{ steps.plugin.outputs.version }}
+        run: npm exec tauri signer sign -- "../../dist/${SLUG}-${VERSION}.zip"
+
+      - name: Publish signed prerelease assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SLUG: ${{ steps.plugin.outputs.slug }}
+          VERSION: ${{ steps.plugin.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "${TAG}" \
+            "dist/${SLUG}-${VERSION}.zip" \
+            "dist/${SLUG}-${VERSION}.zip.sig" \
+            --title "${SLUG} v${VERSION}" \
+            --notes "Independently released Cursor BYOK plugin update." \
+            --prerelease

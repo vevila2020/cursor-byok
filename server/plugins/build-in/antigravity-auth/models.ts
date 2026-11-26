@@ -1,5 +1,10 @@
-import type { JsonValue } from "cursor-byok:plugin";
-import type { ModelDefinition, ModelSnapshot, ModelSupport } from "cursor-byok:model";
+import type { JsonValue, PluginContext } from "cursor-byok:plugin";
+import type {
+  ModelDefinition,
+  ModelListInput,
+  ModelSnapshot,
+  ModelSupport,
+} from "cursor-byok:model";
 import { accountData } from "./resources.ts";
 
 export const ANTIGRAVITY_PROD_ENDPOINT = "https://cloudcode-pa.googleapis.com";
@@ -312,14 +317,6 @@ export function parseAntigravityModels(payload: unknown): ModelDefinition[] {
     });
   }
 
-  // Merge static models from Antigravity catalog that might not be dynamically returned
-  for (const staticModel of STATIC_ANTIGRAVITY_MODELS) {
-    if (!seen.has(staticModel.id)) {
-      seen.add(staticModel.id);
-      models.push(staticModel);
-    }
-  }
-
   return models;
 }
 
@@ -330,7 +327,11 @@ export function reasoningEfforts(model: ModelSnapshot): string[] {
 }
 
 export const antigravityModels: ModelSupport = {
-  list: async ({ resource }, context): Promise<ModelDefinition[]> => {
+  refreshResourceBeforeList: true,
+  list: async (
+    { resource }: ModelListInput,
+    context: PluginContext,
+  ): Promise<ModelDefinition[]> => {
     if (!resource) return STATIC_ANTIGRAVITY_MODELS;
     let data;
     try {

@@ -1,5 +1,11 @@
 import type { JsonValue } from "cursor-byok:plugin";
-import type { ModelDefinition, ModelSnapshot, ModelSupport } from "cursor-byok:model";
+import type { PluginContext } from "cursor-byok:plugin";
+import type {
+  ModelDefinition,
+  ModelListInput,
+  ModelSnapshot,
+  ModelSupport,
+} from "cursor-byok:model";
 import { accountData, accountHeaders } from "./resources.ts";
 
 const MODELS_URL = "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
@@ -103,7 +109,11 @@ export function reasoningEfforts(model: ModelSnapshot): string[] {
 }
 
 export const codexModels: ModelSupport = {
-  list: async ({ resource }, context): Promise<ModelDefinition[]> => {
+  refreshResourceBeforeList: true,
+  list: async (
+    { resource }: ModelListInput,
+    context: PluginContext,
+  ): Promise<ModelDefinition[]> => {
     if (!resource) throw new Error("add a ChatGPT account before syncing Codex models");
     const data = accountData(resource);
     const response = await context.network.fetch(MODELS_URL, {

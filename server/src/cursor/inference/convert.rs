@@ -185,6 +185,9 @@ pub fn prompt_metadata(
 }
 
 fn vendor_for(id: &str, model: Option<&crate::model::ModelConfig>) -> &'static str {
+    if model.is_some_and(|m| m.model_type == crate::model::ModelType::Gemini) {
+        return "google";
+    }
     if model.is_some_and(|model| model.model_type == crate::model::ModelType::Anthropic) {
         return "anthropic";
     }
@@ -520,7 +523,7 @@ pub(super) fn invocation_from_request(
             MESSAGE_ROLE_ASSISTANT => history.push(assistant_message(
                 message,
                 index,
-                session.model.is_anthropic,
+                session.model.provider_type,
                 replay,
                 thinking,
             )?),
@@ -605,7 +608,7 @@ fn user_message(message: &InferenceCoreMessage, index: usize) -> ProjectedMessag
 fn assistant_message(
     message: &InferenceCoreMessage,
     index: usize,
-    is_anthropic: bool,
+    provider_type: Option<crate::model::ProviderType>,
     replay: &ReplayCache,
     thinking_cache: &ThinkingTextCache,
 ) -> Result<ProjectedMessage> {
@@ -644,14 +647,19 @@ fn assistant_message(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let replay_state = if is_anthropic {
+    let replay_state = if provider_type == Some(crate::model::ProviderType::Anthropic) {
         anthropic_replay_state(&message.reasoning_parts, true, thinking_cache)
     } else {
         let call_ids = calls
             .iter()
             .map(|call| call.call_id.clone())
             .collect::<Vec<_>>();
-        replay.find(&call_ids, "openai_responses").cloned()
+        let kind = if provider_type == Some(crate::model::ProviderType::Gemini) {
+            "gemini"
+        } else {
+            "openai_responses"
+        };
+        replay.find(&call_ids, kind).cloned()
     };
     Ok(ProjectedMessage {
         message_id: format!("inference:{index}"),

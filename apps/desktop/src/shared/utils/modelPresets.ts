@@ -1,6 +1,6 @@
 import type { ModelType } from "../api";
+import chatgptIcon from "../assets/provider-icons/chatgpt.png";
 import deepseekIcon from "../assets/provider-icons/deepseek.svg";
-import huoshanIcon from "../assets/provider-icons/huoshan.png";
 import kimiIcon from "../assets/provider-icons/kimi.svg";
 import minimaxIcon from "../assets/provider-icons/minimax.svg";
 import zhipuIcon from "../assets/provider-icons/zhipu.svg";
@@ -29,8 +29,8 @@ export interface ModelPreset {
   name: string;
   icon: string;
   keyHint: string;
-  /** 五家服务商均同时提供 Anthropic 与 OpenAI 兼容协议 */
-  endpoints: { anthropic: ModelPresetEndpoint; openai: ModelPresetEndpoint };
+  resetToOpenAI?: boolean;
+  endpoints: Partial<Record<ModelType, ModelPresetEndpoint>> & { openai: ModelPresetEndpoint };
   models: ModelPresetEntry[];
 }
 
@@ -55,6 +55,17 @@ const openaiChat = (baseUrl: string): ModelPresetEndpoint => ({ baseUrl, useFull
 const openaiFullUrl = (url: string): ModelPresetEndpoint => ({ baseUrl: url, useFullUrl: true, openaiEndpoint: "/v1/chat/completions", customHeaders: null });
 
 export const modelPresets: ModelPreset[] = [
+  {
+    key: "eliasapi",
+    name: "EliasApi",
+    icon: chatgptIcon,
+    keyHint: "GPT 6.2 Astra · OpenAI Responses API",
+    resetToOpenAI: true,
+    endpoints: {
+      openai: { baseUrl: "https://api.elias.kdns.fr", useFullUrl: false, openaiEndpoint: "/v1/responses", customHeaders: null },
+    },
+    models: [entry("GPT-6.2-astra", "GPT 6.2 Astra", 272000, null)],
+  },
   {
     key: "zhipu",
     name: "智谱 GLM",
@@ -99,17 +110,6 @@ export const modelPresets: ModelPreset[] = [
     ],
   },
   {
-    key: "volcengine",
-    name: "火山引擎方舟",
-    icon: huoshanIcon,
-    keyHint: "火山方舟 Coding Plan（ark-code-latest 路由多款代码模型）",
-    endpoints: {
-      anthropic: anthropic("https://ark.cn-beijing.volces.com/api/coding"),
-      openai: openaiFullUrl("https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"),
-    },
-    models: [entry("ark-code-latest", "Ark Code Latest", 256000, 32768)],
-  },
-  {
     key: "minimax",
     name: "MiniMax",
     icon: minimaxIcon,
@@ -125,6 +125,9 @@ export const modelPresets: ModelPreset[] = [
   },
 ];
 
-export const trimTrailingSlash = (url: string) => url.replace(/\/+$/, "");
+const normalizeUrl = (url: string) => url.trim().replace(/\/+$/, "");
 
-export const presetEndpoint = (preset: ModelPreset, type: ModelType): ModelPresetEndpoint => preset.endpoints[type];
+export function matchesPresetUrl(preset: ModelPreset, type: ModelType, url: string): boolean {
+  const endpoint = preset.endpoints[type];
+  return endpoint !== undefined && normalizeUrl(endpoint.baseUrl) === normalizeUrl(url);
+}

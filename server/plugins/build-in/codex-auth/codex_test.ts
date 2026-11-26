@@ -6,6 +6,8 @@ import type {
 } from "cursor-byok:plugin";
 import type { LlmRequest, ModelEvent } from "cursor-byok:provider";
 import type { ResourceSnapshot } from "cursor-byok:resource";
+import { __descriptor, __getRegisteredPlugin } from "cursor-byok:plugin";
+import "./main.ts";
 import { codexDeviceOAuth } from "./oauth.ts";
 import { parseOfficialModels } from "./models.ts";
 import { buildResponsesBody } from "cursor-byok:protocol/openai-responses";
@@ -19,6 +21,8 @@ import {
   parseCredentialFiles,
   presentAccount,
   quotaState,
+  refreshAccount,
+  refreshAccountToken,
   RESOURCE_TYPE,
 } from "./resources.ts";
 
@@ -47,11 +51,11 @@ type StreamHandler = (url: string, init?: RequestInit) => NetworkEventStream;
 function context(handlers: { fetch?: FetchHandler; stream?: StreamHandler }): PluginContext {
   return {
     network: {
-      fetch: (url, init) => {
+      fetch: (url: string, init?: RequestInit) => {
         if (!handlers.fetch) throw new Error("fetch was not expected");
         return Promise.resolve(handlers.fetch(url, init));
       },
-      stream: (url, init) => {
+      stream: (url: string, init?: RequestInit) => {
         if (!handlers.stream) throw new Error("stream was not expected");
         return Promise.resolve(handlers.stream(url, init));
       },
@@ -73,6 +77,11 @@ function snapshot(privateData: JsonValue): ResourceSnapshot {
 async function* sse(lines: string[]): AsyncGenerator<string> {
   for (const line of lines) yield line;
 }
+
+Deno.test("plugin descriptor requests resource refresh before model listing", () => {
+  const descriptor = __descriptor(__getRegisteredPlugin());
+  assertEquals(descriptor.providers[0].refreshResourceBeforeList, true);
+});
 
 function request(): LlmRequest {
   return {
@@ -127,6 +136,90 @@ Deno.test("credential import accepts Codex auth JSON files", () => {
     displayName: "person@example.com",
   }]);
   assertEquals(warnings, ["broken.json: not valid JSON"]);
+});
+
+Deno.test("refresh token rotation is returned for persistence", async () => {
+  const resource = snapshot({
+    accessToken: "old-access-token",
+    refreshToken: "old-refresh-token",
+    accountId: "acct-1",
+    displayName: "person@example.com",
+    quota: null,
+  });
+  let requestBody = "";
+  const patch = await refreshAccountToken(
+    resource,
+    context({
+      fetch: (url, init) => {
+        assertEquals(url, "https://auth.openai.com/oauth/token");
+        requestBody = init?.body ?? "";
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify({
+            access_token: "new-access-token",
+            refresh_token: "rotated-refresh-token",
+          }),
+        };
+      },
+    }),
+  );
+  const data = patch.privateData as Record<string, unknown>;
+  const form = new URLSearchParams(requestBody);
+
+  assertEquals(form.get("grant_type"), "refresh_token");
+  assertEquals(form.get("refresh_token"), "old-refresh-token");
+  assertEquals(data.accessToken, "new-access-token");
+  assertEquals(data.refreshToken, "rotated-refresh-token");
+  assertEquals(patch.state, { status: "ready" });
+});
+
+Deno.test("invalid_grant invalidates a revoked Codex refresh token", async () => {
+  const resource = snapshot({
+    accessToken: "old-access-token",
+    refreshToken: "revoked-refresh-token",
+    accountId: "acct-1",
+    displayName: "person@example.com",
+    quota: null,
+  });
+  const patch = await refreshAccountToken(
+    resource,
+    context({
+      fetch: () => ({
+        status: 400,
+        headers: {},
+        body: JSON.stringify({ error: "invalid_grant" }),
+      }),
+    }),
+  );
+
+  assertEquals(patch.state, {
+    status: "invalid",
+    message: "ChatGPT authorization expired; sign in again",
+  });
+});
+
+Deno.test("temporary Codex refresh failures do not invalidate the account", async () => {
+  const resource = snapshot({
+    accessToken: "old-access-token",
+    refreshToken: "refresh-token",
+    accountId: "acct-1",
+    displayName: "person@example.com",
+    quota: null,
+  });
+  let requestCount = 0;
+  const patch = await refreshAccount(
+    resource,
+    context({
+      fetch: () => {
+        requestCount += 1;
+        return { status: 503, headers: {}, body: "service unavailable" };
+      },
+    }),
+  );
+
+  assert(requestCount === 1, "usage lookup should wait until OAuth refresh succeeds");
+  assertEquals(patch.state, undefined);
 });
 
 Deno.test("usage maps secondary to weekly and primary to five-hour quota", () => {
@@ -361,7 +454,7 @@ Deno.test("invoke streams normalized events from the Codex Responses API", async
       resource: snapshot(draft.privateData),
       request: request(),
     },
-    { emit: (event) => events.push(event) },
+    { emit: (event: ModelEvent) => events.push(event) },
     context({
       stream: (url, init) => {
         assertEquals(url, "https://chatgpt.com/backend-api/codex/responses");
@@ -411,6 +504,59 @@ Deno.test("invoke streams normalized events from the Codex Responses API", async
     { type: "text-end" },
     { type: "done", reason: "stop" },
   ]);
+});
+
+Deno.test("invoke refreshes an expired Codex token and retries once", async () => {
+  const resource = snapshot({
+    accessToken: "old-access-token",
+    refreshToken: "old-refresh-token",
+    accountId: "acct-1",
+    displayName: "person@example.com",
+    quota: null,
+  });
+  const authorizationHeaders: string[] = [];
+  let streamCount = 0;
+  const result = await codexProvider.invoke(
+    {
+      model: { id: "gpt-test", displayName: "GPT Test", privateData: { reasoningEfforts: [] } },
+      resource,
+      request: request(),
+    },
+    { emit: () => undefined },
+    context({
+      fetch: (url) => {
+        assertEquals(url, "https://auth.openai.com/oauth/token");
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify({
+            access_token: "new-access-token",
+            refresh_token: "new-refresh-token",
+          }),
+        };
+      },
+      stream: (_url, init) => {
+        streamCount += 1;
+        authorizationHeaders.push(init?.headers?.authorization ?? "");
+        if (streamCount === 1) {
+          return { status: 401, headers: {}, lines: sse(["data: expired"]) };
+        }
+        return {
+          status: 200,
+          headers: {},
+          lines: sse(['data: {"type":"response.completed","response":{}}']),
+        };
+      },
+    }),
+  );
+
+  assertEquals(result.status, "completed");
+  assertEquals(streamCount, 2);
+  assertEquals(authorizationHeaders, ["Bearer old-access-token", "Bearer new-access-token"]);
+  assertEquals(
+    (result.patch?.privateData as Record<string, unknown>).refreshToken,
+    "new-refresh-token",
+  );
 });
 
 Deno.test("reasoning replay projects response items to valid input items", () => {
@@ -464,7 +610,7 @@ Deno.test("invoke streams incremental tool calls and replays reasoning items", a
       resource: snapshot(draft.privateData),
       request: request(),
     },
-    { emit: (event) => events.push(event) },
+    { emit: (event: ModelEvent) => events.push(event) },
     context({
       stream: () => ({
         status: 200,
@@ -498,6 +644,7 @@ Deno.test("invoke streams incremental tool calls and replays reasoning items", a
 Deno.test("invoke maps quota failures to a cooling resource error", async () => {
   assert(!isQuotaError("429 rate_limit_reached"));
   assert(isQuotaError("429 usage_limit_reached: 5-hour limit"));
+  assert(isQuotaError("credit_balance_exhausted"));
   const token = jwt({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" } });
   const draft = await credentialDraft({
     accessToken: token,
@@ -525,4 +672,34 @@ Deno.test("invoke maps quota failures to a cooling resource error", async () => 
     result.patch.state.retryAtMs !== undefined && result.patch.state.retryAtMs > Date.now(),
     "cooling should carry the parsed reset time",
   );
+});
+
+Deno.test("invoke surfaces both OpenAI Responses error event forms", async () => {
+  const token = jwt({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" } });
+  const draft = await credentialDraft({
+    accessToken: token,
+    refreshToken: null,
+    displayName: null,
+  });
+  for (
+    const event of [
+      'data: {"type":"error","error":{"code":"api_key_spend_limit_exceeded","message":"API spend limit reached"}}',
+      'data: {"type":"response.failed","response":{"error":{"code":"project_spend_limit_exceeded","message":"Project spend limit reached"}}}',
+    ]
+  ) {
+    const result = await codexProvider.invoke(
+      {
+        model: { id: "gpt-test", displayName: "GPT Test" },
+        resource: snapshot(draft.privateData),
+        request: request(),
+      },
+      { emit: () => {} },
+      context({
+        stream: () => ({ status: 200, headers: {}, lines: sse([event]) }),
+      }),
+    );
+    assert(result.status === "request-error", `expected request-error, received ${result.status}`);
+    assert(result.message.includes("spend_limit_exceeded"), "error code should be preserved");
+    assert(result.message.includes("spend limit reached"), "provider detail should be preserved");
+  }
 });

@@ -4,7 +4,7 @@ import Sortable from "sortablejs";
 import type { Model, PluginModelDescriptor } from "../../shared/api";
 import { Card } from "../../shared/ui/Card";
 import { Icon } from "../../shared/ui/Icon";
-import { chevronDownIcon, chevronRightIcon, claudeIcon, dragIcon, editIcon, flatColorOrganizationIcon, openAiIcon } from "../../shared/ui/icons";
+import { chevronDownIcon, chevronRightIcon, claudeIcon, dragIcon, editIcon, flatColorOrganizationIcon, geminiIcon, openAiIcon } from "../../shared/ui/icons";
 import { TruncatedButton } from "../../shared/ui/TruncatedButton";
 import { CursorModelTestResult, type CursorModelTestState } from "./CursorModelTestResult";
 import styles from "./CursorSettings.module.scss";
@@ -273,8 +273,8 @@ function ModelGrid({
               <span className={styles.modelCardModelId}>{model.model_id}</span>
             </div>
             <span className={styles.modelTypeBadge}>
-              <Icon icon={model.type === "anthropic" ? claudeIcon : openAiIcon} />
-              {model.type === "anthropic" ? "Anthropic" : "OpenAI"}
+              <Icon icon={model.type === "anthropic" ? claudeIcon : model.type === "gemini" ? geminiIcon : openAiIcon} />
+              {model.type === "anthropic" ? "Anthropic" : model.type === "gemini" ? "Gemini" : "OpenAI"}
             </span>
           </div>
           <div className={styles.modelCardTest}>
@@ -312,6 +312,7 @@ function providerDomain(baseUrl: string) {
 }
 
 function typeGroup(model: Model) {
+  if (model.type === "gemini") return { key: "gemini", label: "Gemini", icon: geminiIcon };
   if (model.type === "anthropic") return { key: "anthropic", label: "Anthropic", icon: claudeIcon };
   if (model.openai_endpoint === "/v1/chat/completions") return { key: "openai-chat", label: "OpenAI Chat", icon: openAiIcon };
   return { key: "openai-responses", label: "OpenAI Responses", icon: openAiIcon };

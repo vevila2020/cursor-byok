@@ -1,6 +1,6 @@
 import type { CommitPromptLocale, Locale } from "../i18n/runtime";
 
-export type ModelType = "openai" | "anthropic";
+export type ModelType = "openai" | "anthropic" | "gemini";
 
 export interface Model {
   model_hash: string;
@@ -314,6 +314,17 @@ export interface PluginDescriptor {
   resources: PluginResourceDescriptor[];
 }
 
+export interface PluginUpdateInfo {
+  pluginId: string;
+  installedVersion: string;
+  availableVersion: string;
+}
+
+export interface PluginUpdateStage {
+  pluginId: string;
+  version: string;
+}
+
 export interface PluginOAuthBegin {
   sessionId: string;
   userCode: string | null;
@@ -500,6 +511,8 @@ export const api = {
   initializeCursorCa: () => request<CursorHarnessStatus>("/harness/cursor/ca/initialize", { method: "POST" }),
   launchCursor: () => request<void>("/harness/cursor/launch", { method: "POST" }),
   plugins: () => request<PluginDescriptor[]>("/plugins"),
+  pluginUpdates: (refresh = false) => request<PluginUpdateInfo[]>(`/plugins/updates${refresh ? "?refresh=true" : ""}`),
+  updatePlugin: (pluginId: string) => request<PluginUpdateStage>(`/plugins/${encodeURIComponent(pluginId)}`, { method: "POST" }),
   pluginOAuthBegin: (pluginId: string, resourceType: string, methodId: string) => request<PluginOAuthBegin>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/add/${encodeURIComponent(methodId)}/begin`, { method: "POST" }),
   pluginOAuthPoll: (sessionId: string, signal?: AbortSignal) => request<PluginOAuthPoll>(`/plugins/oauth/${encodeURIComponent(sessionId)}/poll`, { method: "POST", signal }),
   importPluginResources: (pluginId: string, resourceType: string, files: PluginImportFile[]) => request<PluginImportResult>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/import`, { method: "POST", body: JSON.stringify(files) }),

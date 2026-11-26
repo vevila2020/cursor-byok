@@ -5,6 +5,12 @@
   gap: 16px;
 }
 
+.pageToolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .takeoverActions {
   display: flex;
   align-items: center;
@@ -12,31 +18,42 @@
 }
 
 .takeoverStatus {
-  min-width: 39px;
+  padding: 2px 7px;
   color: var(--vscode-descriptionForeground);
+  border: 1px solid var(--vscode-sideBar-border);
+  border-radius: 999px;
   font-size: type.$font-size-xs;
-  text-align: right;
   white-space: nowrap;
+
+  &[data-taken] {
+    color: var(--vscode-testing-iconPassed, #73c991);
+    background: color-mix(in srgb, var(--vscode-testing-iconPassed, #73c991) 10%, transparent);
+    border-color: color-mix(in srgb, var(--vscode-testing-iconPassed, #73c991) 28%, transparent);
+  }
+}
+
+.pageTools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .launchButton {
-  height: 25px;
-  padding: 0 8px;
-  color: var(--vscode-descriptionForeground);
-  background: transparent;
-  border: 1px solid var(--vscode-sideBar-border);
-  border-radius: 5px;
+  justify-content: center;
   font-size: type.$font-size-xs;
-  white-space: nowrap;
+  line-height: 1;
+}
 
-  &:hover:not(:disabled) { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
-  &:disabled { opacity: 0.5; cursor: not-allowed; }
+.launchLabel {
+  position: relative;
+  top: -1px;
 }
 
 .groupActions {
   display: flex;
   align-items: center;
   overflow: hidden;
+  border: 1px solid var(--vscode-sideBar-border);
   border-radius: 5px;
 
   button {

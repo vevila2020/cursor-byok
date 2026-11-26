@@ -2,6 +2,7 @@ import type {
   LlmContentPart,
   LlmMessage,
   LlmRequest,
+  LlmTool,
   ProviderInvokeInput,
   ProviderOutput,
   ProviderResult,
@@ -212,7 +213,7 @@ function convertToCloudCodeContents(
   for (const msg of messages) {
     if (msg.role === "system") {
       const txt = msg.content
-        .map((p) => (p.type === "text" ? p.text : ""))
+        .map((p: LlmContentPart) => (p.type === "text" ? p.text : ""))
         .filter(Boolean)
         .join("\n");
       if (txt) {
@@ -323,7 +324,7 @@ async function streamCloudCode(
   const tools = input.request.tools && input.request.tools.length > 0
     ? [
       {
-        functionDeclarations: input.request.tools.map((t) => ({
+        functionDeclarations: input.request.tools.map((t: LlmTool) => ({
           name: t.name,
           description: t.description || "",
           parameters: sanitizeSchema(t.parameters),
@@ -650,9 +651,10 @@ async function invoke(
       : { status: "completed" };
   } catch (error) {
     if (error instanceof HttpError) {
+      const httpError = error as HttpError;
       if (
-        (error.status === 401 || error.status === 403) && data.refreshToken &&
-        !isQuotaHttpError(error)
+        (httpError.status === 401 || httpError.status === 403) && data.refreshToken &&
+        !isQuotaHttpError(httpError)
       ) {
         try {
           const refreshed = await refreshAccount(input.resource, context);
@@ -676,14 +678,14 @@ async function invoke(
           // Failed refresh
         }
       }
-      if (isQuotaHttpError(error)) {
+      if (isQuotaHttpError(httpError)) {
         return {
           status: "resource-error",
-          message: error.message,
-          patch: quotaExhaustedPatch(data, error.body),
+          message: httpError.message,
+          patch: quotaExhaustedPatch(data, httpError.body),
         };
       }
-      return { status: "request-error", message: error.message };
+      return { status: "request-error", message: httpError.message };
     }
     const message = error instanceof Error ? error.message : String(error);
     if (isQuotaError(message)) {

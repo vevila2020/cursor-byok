@@ -24,6 +24,8 @@ export type ModelListInput = {
 };
 
 export type ModelSupport = {
+  /** Refresh the provider's account resource and persist token rotation before listing models. */
+  refreshResourceBeforeList?: boolean;
   /** 列举成功后,宿主用返回值整体替换该 Provider 的模型目录。 */
   list(input: ModelListInput, context: PluginContext): Promise<ModelDefinition[]>;
 };

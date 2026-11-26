@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, pluginText, type PluginDescriptor, type PluginImportFile, type PluginRuntimePhase, type PluginRuntimeStatus } from "../../shared/api";
 import { useI18n } from "../../i18n/store";
 import { PageContent } from "../../shell/layout/PageContent";
+import { PageActions } from "../../shell/PageActions";
 import { appStore, useAppStore } from "../../shared/store/appStore";
 import { ActionMenu, type ActionMenuItem } from "../../shared/ui/ActionMenu";
 import { Button } from "../../shared/ui/Button";
@@ -11,11 +12,16 @@ import { useMessage } from "../../shared/ui/message";
 import { TruncatedButton } from "../../shared/ui/TruncatedButton";
 import { PluginAddPanel, PluginSettingsPanel } from "./PluginResourcePanels";
 import styles from "./PluginManagementPage.module.scss";
+import { restartApp } from "../../shared/native/appLifecycle";
 
 export function PluginManagementPage() {
-  const { pluginRuntime, plugins } = useAppStore();
+  const { pluginRuntime, plugins, pluginUpdates, pluginRestartRequired } = useAppStore();
+  const message = useMessage();
   const [progressOpen, setProgressOpen] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [updatingPluginId, setUpdatingPluginId] = useState<string | null>(null);
+  const [restartPromptOpen, setRestartPromptOpen] = useState(false);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [selected, setSelected] = useState<{ pluginId: string; mode: "add" | "settings" } | null>(null);
   const cancelRequested = useRef(false);
   const selectedPlugin = selected ? plugins.find((plugin) => plugin.id === selected.pluginId) ?? null : null;
@@ -53,8 +59,45 @@ export function PluginManagementPage() {
     }
   };
 
+  const updatePlugin = async (pluginId: string) => {
+    if (updatingPluginId) return;
+    setUpdatingPluginId(pluginId);
+    try {
+      await api.updatePlugin(pluginId);
+      appStore.setPluginRestartRequired(true);
+      setRestartPromptOpen(true);
+      await appStore.refreshPlugins();
+    } catch (cause) {
+      message(cause instanceof Error ? cause.message : String(cause), { duration: 6000 });
+    } finally {
+      setUpdatingPluginId(null);
+    }
+  };
+
+  const checkPluginUpdates = async () => {
+    if (checkingUpdates) return;
+    setCheckingUpdates(true);
+    const checked = await appStore.refreshPluginUpdates(true);
+    setCheckingUpdates(false);
+    if (!checked) {
+      message(t("检查插件更新失败"), { duration: 5000 });
+    } else if (appStore.getSnapshot().pluginUpdates.length === 0) {
+      message(t("插件已是最新版本"));
+    } else {
+      message(t("发现 {count} 个插件更新", { count: appStore.getSnapshot().pluginUpdates.length }));
+    }
+  };
+
   const content = pluginRuntime?.state === "ready"
-    ? <PluginCards plugins={plugins} onOpen={(pluginId, mode) => setSelected({ pluginId, mode })} />
+    ? <PluginCards
+        plugins={plugins}
+        updates={pluginUpdates}
+        updatingPluginId={updatingPluginId}
+        restartRequired={pluginRestartRequired}
+        onUpdate={(pluginId) => void updatePlugin(pluginId)}
+        onRestart={() => void restartApp()}
+        onOpen={(pluginId, mode) => setSelected({ pluginId, mode })}
+      />
     : <RuntimeGate status={pluginRuntime} starting={starting} onInitialize={() => void initialize()} />;
   const estimatedHeight = plugins.length > 0
     ? Math.max(320, Math.ceil(plugins.length / 3) * 180)
@@ -65,12 +108,27 @@ export function PluginManagementPage() {
       title={t("插件配置")}
       sections={[{ key: "installed-plugins", estimatedHeight, content }]}
     />
+    {pluginRuntime?.state === "ready" && <PageActions>
+      <Button size="small" disabled={checkingUpdates} onClick={() => void checkPluginUpdates()}>
+        {checkingUpdates ? t("正在检查插件更新…") : t("检查插件更新")}
+      </Button>
+    </PageActions>}
     <RuntimeProgressModal
       open={progressOpen}
       status={pluginRuntime}
       starting={starting}
       onClose={closeProgress}
     />
+    <Modal
+      open={restartPromptOpen}
+      title={t("插件更新已安装")}
+      closeLabel={t("稍后")}
+      submitLabel={t("立即重启")}
+      onClose={() => setRestartPromptOpen(false)}
+      onSubmit={() => void restartApp()}
+    >
+      <p>{t("重启应用后，插件更新将生效。")}</p>
+    </Modal>
     <Modal
       fullHeight
       open={selectedPlugin !== null}
@@ -114,8 +172,13 @@ function RuntimeGate({ status, starting, onInitialize }: { status: PluginRuntime
   </div>;
 }
 
-function PluginCards({ plugins, onOpen }: {
+function PluginCards({ plugins, updates, updatingPluginId, restartRequired, onUpdate, onRestart, onOpen }: {
   plugins: PluginDescriptor[];
+  updates: import("../../shared/api").PluginUpdateInfo[];
+  updatingPluginId: string | null;
+  restartRequired: boolean;
+  onUpdate: (pluginId: string) => void;
+  onRestart: () => void;
   onOpen: (pluginId: string, mode: "add" | "settings") => void;
 }) {
   if (plugins.length === 0) {
@@ -124,13 +187,29 @@ function PluginCards({ plugins, onOpen }: {
       <span>{t("安装插件后会显示在这里。")}</span>
     </div>;
   }
-  return <div className={styles.pluginGrid}>
-    {plugins.map((plugin) => <PluginCard key={plugin.id} plugin={plugin} onOpen={onOpen} />)}
-  </div>;
+  return <>
+    {restartRequired && <div className={styles.updateNotice}>
+      <span>{t("插件更新已下载，需要重启应用后生效。")}</span>
+      <Button size="small" variant="primary" onClick={onRestart}>{t("立即重启")}</Button>
+    </div>}
+    <div className={styles.pluginGrid}>
+      {plugins.map((plugin) => <PluginCard
+        key={plugin.id}
+        plugin={plugin}
+        update={updates.find((entry) => entry.pluginId === plugin.id) ?? null}
+        updating={updatingPluginId === plugin.id}
+        onUpdate={onUpdate}
+        onOpen={onOpen}
+      />)}
+    </div>
+  </>;
 }
 
-function PluginCard({ plugin, onOpen }: {
+function PluginCard({ plugin, update, updating, onUpdate, onOpen }: {
   plugin: PluginDescriptor;
+  update: import("../../shared/api").PluginUpdateInfo | null;
+  updating: boolean;
+  onUpdate: (pluginId: string) => void;
   onOpen: (pluginId: string, mode: "add" | "settings") => void;
 }) {
   const { locale } = useI18n();
@@ -241,6 +320,14 @@ function PluginCard({ plugin, onOpen }: {
             onClick={() => onOpen(plugin.id, "settings")}
           />
         )}
+        {update && <Button
+          size="small"
+          variant="primary"
+          disabled={updating}
+          onClick={() => onUpdate(plugin.id)}
+        >
+          {updating ? t("正在更新…") : t("更新到 v{version}", { version: update.availableVersion })}
+        </Button>}
         {moreItems.length > 0 && (
           <span className={styles.moreAction}>
             <ActionMenu label={t("更多")} items={moreItems} />

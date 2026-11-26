@@ -40,8 +40,9 @@ export function App() {
 }
 
 function AppMessages() {
-  const { error } = useAppStore();
+  const { error, pluginUpdates } = useAppStore();
   const previousError = useRef<string | null>(null);
+  const previousPluginUpdates = useRef("");
   const lastAutomaticUpdateCheckAt = useRef(0);
   const showMessage = useMessage();
 
@@ -49,6 +50,21 @@ function AppMessages() {
     if (error && error !== previousError.current) showMessage(error);
     previousError.current = error;
   }, [error, showMessage]);
+
+  useEffect(() => {
+    const signature = pluginUpdates
+      .map((plugin) => `${plugin.pluginId}@${plugin.availableVersion}`)
+      .sort()
+      .join(",");
+    if (!signature || signature === previousPluginUpdates.current) {
+      previousPluginUpdates.current = signature;
+      return;
+    }
+    previousPluginUpdates.current = signature;
+    showMessage(t("发现 {count} 个插件有更新，可在插件配置中安装", {
+      count: pluginUpdates.length,
+    }), { duration: 8_000 });
+  }, [pluginUpdates, showMessage]);
 
   useEffect(() => {
     let disposed = false;

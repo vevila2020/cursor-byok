@@ -30,6 +30,7 @@ hudsucker = { version = "0.25", features = ["http2"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 include_dir = "0.7"
 json5 = "0.4"
+minisign-verify = "0.2.5"
 parking_lot = "0.12"
 pem = "3"
 prost = "0.13"

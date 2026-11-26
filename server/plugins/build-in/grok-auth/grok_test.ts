@@ -6,6 +6,8 @@ import type {
 } from "cursor-byok:plugin";
 import type { LlmRequest, ModelEvent } from "cursor-byok:provider";
 import type { ResourceSnapshot } from "cursor-byok:resource";
+import { __descriptor, __getRegisteredPlugin } from "cursor-byok:plugin";
+import "./main.ts";
 import { grokDeviceOAuth } from "./oauth.ts";
 import { FALLBACK_MODELS, grokModels, parseGrokModels } from "./models.ts";
 import { grokProvider, isQuotaError } from "./provider.ts";
@@ -16,6 +18,8 @@ import {
   parseGrokUsage,
   presentAccount,
   quotaState,
+  refreshAccount,
+  refreshAccountToken,
   RESOURCE_TYPE,
 } from "./resources.ts";
 
@@ -44,11 +48,11 @@ type StreamHandler = (url: string, init?: RequestInit) => NetworkEventStream;
 function context(handlers: { fetch?: FetchHandler; stream?: StreamHandler }): PluginContext {
   return {
     network: {
-      fetch: (url, init) => {
+      fetch: (url: string, init?: RequestInit) => {
         if (!handlers.fetch) throw new Error("fetch was not expected");
         return Promise.resolve(handlers.fetch(url, init));
       },
-      stream: (url, init) => {
+      stream: (url: string, init?: RequestInit) => {
         if (!handlers.stream) throw new Error("stream was not expected");
         return Promise.resolve(handlers.stream(url, init));
       },
@@ -70,6 +74,11 @@ function snapshot(privateData: JsonValue): ResourceSnapshot {
 async function* sse(lines: string[]): AsyncGenerator<string> {
   for (const line of lines) yield line;
 }
+
+Deno.test("plugin descriptor requests resource refresh before model listing", () => {
+  const descriptor = __descriptor(__getRegisteredPlugin());
+  assertEquals(descriptor.providers[0].refreshResourceBeforeList, true);
+});
 
 function request(): LlmRequest {
   return {
@@ -119,6 +128,87 @@ Deno.test("credential import accepts Grok credential JSON files", () => {
     displayName: "a@x.ai",
   }]);
   assertEquals(warnings, ["broken.json: not valid JSON"]);
+});
+
+Deno.test("refresh token rotation is returned for persistence", async () => {
+  const resource = snapshot({
+    accessToken: "old-access-token",
+    refreshToken: "old-refresh-token",
+    displayName: "person@x.ai",
+    quota: null,
+  });
+  let requestBody = "";
+  const patch = await refreshAccountToken(
+    resource,
+    context({
+      fetch: (url, init) => {
+        assertEquals(url, "https://auth.x.ai/oauth2/token");
+        requestBody = init?.body ?? "";
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify({
+            access_token: "new-access-token",
+            refresh_token: "rotated-refresh-token",
+          }),
+        };
+      },
+    }),
+  );
+  const data = patch.privateData as Record<string, unknown>;
+  const form = new URLSearchParams(requestBody);
+
+  assertEquals(form.get("grant_type"), "refresh_token");
+  assertEquals(form.get("refresh_token"), "old-refresh-token");
+  assertEquals(data.accessToken, "new-access-token");
+  assertEquals(data.refreshToken, "rotated-refresh-token");
+  assertEquals(patch.state, { status: "ready" });
+});
+
+Deno.test("invalid_grant invalidates a revoked Grok refresh token", async () => {
+  const resource = snapshot({
+    accessToken: "old-access-token",
+    refreshToken: "revoked-refresh-token",
+    displayName: "person@x.ai",
+    quota: null,
+  });
+  const patch = await refreshAccountToken(
+    resource,
+    context({
+      fetch: () => ({
+        status: 400,
+        headers: {},
+        body: JSON.stringify({ error: "invalid_grant" }),
+      }),
+    }),
+  );
+
+  assertEquals(patch.state, {
+    status: "invalid",
+    message: "Grok authorization expired; sign in again",
+  });
+});
+
+Deno.test("temporary Grok refresh failures do not invalidate the account", async () => {
+  const resource = snapshot({
+    accessToken: "old-access-token",
+    refreshToken: "refresh-token",
+    displayName: "person@x.ai",
+    quota: null,
+  });
+  let requestCount = 0;
+  const patch = await refreshAccount(
+    resource,
+    context({
+      fetch: () => {
+        requestCount += 1;
+        return { status: 503, headers: {}, body: "service unavailable" };
+      },
+    }),
+  );
+
+  assert(requestCount === 1, "usage lookup should wait until OAuth refresh succeeds");
+  assertEquals(patch.state, undefined);
 });
 
 Deno.test("credit usage percent is inverted to remaining and drives cooling", () => {
@@ -186,6 +276,33 @@ Deno.test("model discovery falls back to known models when the account cannot li
     }),
   );
   assertEquals(models, FALLBACK_MODELS);
+});
+
+Deno.test("model discovery does not mask an unauthorized account as a fallback catalog", async () => {
+  const resource = snapshot({
+    accessToken: "expired-access-token",
+    refreshToken: null,
+    displayName: "person@x.ai",
+    quota: null,
+  });
+  let failed = false;
+  let requestHeaders: Record<string, string> = {};
+  try {
+    await grokModels.list(
+      { resource },
+      context({
+        fetch: (_url, init) => {
+          requestHeaders = init?.headers ?? {};
+          return { status: 401, headers: {}, body: "unauthorized" };
+        },
+      }),
+    );
+  } catch {
+    failed = true;
+  }
+
+  assert(failed, "an unauthorized response should preserve the existing model catalog");
+  assertEquals(requestHeaders["x-xai-token-auth"], "xai-grok-cli");
 });
 
 Deno.test("device OAuth begins with a host-held session and completes with a resource draft", async () => {
@@ -256,7 +373,7 @@ Deno.test("invoke streams normalized events from the xAI Chat Completions API", 
       resource: snapshot(draft.privateData),
       request: request(),
     },
-    { emit: (event) => events.push(event) },
+    { emit: (event: ModelEvent) => events.push(event) },
     context({
       stream: (url, init) => {
         assertEquals(url, "https://api.x.ai/v1/chat/completions");
@@ -283,6 +400,8 @@ Deno.test("invoke streams normalized events from the xAI Chat Completions API", 
   assert(!("reasoning_effort" in body), "xAI endpoint rejects reasoning_effort");
   assert(!("service_tier" in body), "xAI endpoint rejects service_tier");
   assertEquals(requestHeaders["authorization"], `Bearer ${token}`);
+  assertEquals(requestHeaders["x-xai-token-auth"], "xai-grok-cli");
+  assertEquals(requestHeaders.accept, "text/event-stream");
   assertEquals(events, [
     { type: "text-start" },
     { type: "text-delta", text: "Hel" },
@@ -303,6 +422,61 @@ Deno.test("invoke streams normalized events from the xAI Chat Completions API", 
   ]);
 });
 
+Deno.test("invoke refreshes an expired Grok token and retries once", async () => {
+  const resource = snapshot({
+    accessToken: "old-access-token",
+    refreshToken: "old-refresh-token",
+    displayName: "person@x.ai",
+    quota: null,
+  });
+  const authorizationHeaders: string[] = [];
+  const tokenAuthHeaders: string[] = [];
+  let streamCount = 0;
+  const result = await grokProvider.invoke(
+    {
+      model: { id: "grok-test", displayName: "Grok Test" },
+      resource,
+      request: request(),
+    },
+    { emit: () => undefined },
+    context({
+      fetch: (url) => {
+        assertEquals(url, "https://auth.x.ai/oauth2/token");
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify({
+            access_token: "new-access-token",
+            refresh_token: "new-refresh-token",
+          }),
+        };
+      },
+      stream: (_url, init) => {
+        streamCount += 1;
+        authorizationHeaders.push(init?.headers?.authorization ?? "");
+        tokenAuthHeaders.push(init?.headers?.["x-xai-token-auth"] ?? "");
+        if (streamCount === 1) {
+          return { status: 401, headers: {}, lines: sse(["data: expired"]) };
+        }
+        return {
+          status: 200,
+          headers: {},
+          lines: sse(['data: {"choices":[{"delta":{},"finish_reason":"stop"}]}']),
+        };
+      },
+    }),
+  );
+
+  assertEquals(result.status, "completed");
+  assertEquals(streamCount, 2);
+  assertEquals(authorizationHeaders, ["Bearer old-access-token", "Bearer new-access-token"]);
+  assertEquals(tokenAuthHeaders, ["xai-grok-cli", "xai-grok-cli"]);
+  assertEquals(
+    (result.patch?.privateData as Record<string, unknown>).refreshToken,
+    "new-refresh-token",
+  );
+});
+
 Deno.test("invoke streams incremental tool calls and reasoning replay state", async () => {
   const token = jwt({ sub: "user-1" });
   const draft = await credentialDraft({
@@ -317,7 +491,7 @@ Deno.test("invoke streams incremental tool calls and reasoning replay state", as
       resource: snapshot(draft.privateData),
       request: request(),
     },
-    { emit: (event) => events.push(event) },
+    { emit: (event: ModelEvent) => events.push(event) },
     context({
       stream: () => ({
         status: 200,

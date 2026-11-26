@@ -179,7 +179,10 @@ const PLUGINS: &[(&str, &[(&str, &str)])] = &[
 pub(super) fn install(installed: &Path) -> Result<()> {
     for (name, files) in PLUGINS {
         let directory = installed.join(name);
-        if disk_version(&directory) == Some(embedded_version(files)?) {
+        let embedded = embedded_version(files)?;
+        if disk_version(&directory)
+            .is_some_and(|version| super::manifest::version_at_least(&version, &embedded))
+        {
             continue;
         }
         write_plugin(&directory, files)?;

@@ -217,6 +217,17 @@ function usageEvent(value: unknown): ModelEvent {
   };
 }
 
+function responseError(value: Record<string, unknown>): string {
+  const response = record(value.response);
+  const error = record(value.error) ?? record(response?.error);
+  const code = text(error?.code) ?? text(value.code);
+  const message = text(error?.message) ?? text(value.message);
+  if (code && message) return `${code}: ${message}`;
+  if (message) return message;
+  if (code) return code;
+  return JSON.stringify(value);
+}
+
 async function readBody(lines: AsyncIterable<string>): Promise<string> {
   const collected: string[] = [];
   for await (const line of lines) collected.push(line);
@@ -411,8 +422,9 @@ export async function streamOpenAiResponses(
         output.emit({ type: "done", reason: "length" });
         break;
       }
+      case "error":
       case "response.failed":
-        throw new Error(`OpenAI Responses failed: ${payload}`);
+        throw new Error(`OpenAI Responses failed: ${responseError(value)}`);
     }
     if (terminal) break;
   }

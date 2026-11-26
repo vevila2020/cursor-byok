@@ -1,6 +1,6 @@
 //! Exposes plugin discovery, resource lifecycle, model sync, and runtime endpoints.
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -17,6 +17,26 @@ use super::ControlService;
 
 pub async fn list(State(service): State<ControlService>) -> Result<Json<Vec<PluginDescriptor>>> {
     Ok(Json(service.plugins().await))
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct UpdateQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+pub async fn updates(
+    State(service): State<ControlService>,
+    Query(query): Query<UpdateQuery>,
+) -> Result<Json<Vec<crate::plugin::PluginUpdateInfo>>> {
+    Ok(Json(service.plugin_updates(query.refresh).await?))
+}
+
+pub async fn update(
+    State(service): State<ControlService>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<crate::plugin::PluginUpdateStage>> {
+    Ok(Json(service.update_plugin(&plugin_id).await?))
 }
 
 pub async fn remove(

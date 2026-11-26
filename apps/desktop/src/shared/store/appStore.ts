@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { api, type CursorHarnessStatus, type LlmCall, type Model, type ModelInput, type Overview, type PluginDescriptor, type PluginRuntimeStatus, type PortSettings, type TokenPricingSettings } from "../api";
+import { api, type CursorHarnessStatus, type LlmCall, type Model, type ModelInput, type Overview, type PluginDescriptor, type PluginRuntimeStatus, type PluginUpdateInfo, type PortSettings, type TokenPricingSettings } from "../api";
 import { applyTheme, isThemeId, type ThemeId } from "../theme/theme";
 
 export const DEFAULT_TOKEN_PRICING: TokenPricingSettings = {
@@ -23,6 +23,8 @@ export type AppSnapshot = {
   cursorBusy: boolean;
   pluginRuntime: PluginRuntimeStatus | null;
   plugins: PluginDescriptor[];
+  pluginUpdates: PluginUpdateInfo[];
+  pluginRestartRequired: boolean;
 };
 
 const savedTheme = (): ThemeId => {
@@ -58,6 +60,8 @@ let snapshot: AppSnapshot = {
   cursorBusy: false,
   pluginRuntime: null,
   plugins: [],
+  pluginUpdates: [],
+  pluginRestartRequired: false,
 };
 
 const listeners = new Set<() => void>();
@@ -85,6 +89,7 @@ export const appStore = {
 
   async refresh() {
     update({ busy: true, error: null });
+    void appStore.refreshPluginUpdates();
     try {
       const [models, calls, overview, settings, ports, pricing, cursorHarness, pluginRuntime, plugins] = await Promise.all([
         api.models(),
@@ -162,9 +167,22 @@ export const appStore = {
   async refreshPlugins() {
     try {
       update({ plugins: await api.plugins() });
+      void appStore.refreshPluginUpdates();
     } catch (cause) {
       update({ error: cause instanceof Error ? cause.message : String(cause) });
     }
+  },
+  async refreshPluginUpdates(force = false): Promise<boolean> {
+    try {
+      update({ pluginUpdates: await api.pluginUpdates(force) });
+      return true;
+    } catch {
+      // Plugin update checks are best-effort and must not block startup.
+      return false;
+    }
+  },
+  setPluginRestartRequired(required: boolean) {
+    update({ pluginRestartRequired: required });
   },
   async removePluginConfiguration(pluginId: string) {
     await perform(async () => {

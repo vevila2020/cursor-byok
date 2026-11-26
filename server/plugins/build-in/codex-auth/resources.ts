@@ -17,6 +17,8 @@ import type {
 export const RESOURCE_TYPE = "chatgpt-account";
 
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
+const OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 const RESET_CREDITS_CONSUME_URL = `${RESET_CREDITS_URL}/consume`;
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
@@ -492,29 +494,104 @@ export async function refreshAccount(
   resource: ResourceSnapshot,
   context: PluginContext,
 ): Promise<ResourcePatch> {
-  const data = accountData(resource);
-  const response = await context.network.fetch(USAGE_URL, {
-    method: "GET",
-    headers: accountHeaders(data),
-  });
+  const originalData = accountData(resource);
+  const tokenPatch = await refreshAccountToken(resource, context);
+  if (tokenPatch.state?.status === "invalid") return tokenPatch;
+  if (originalData.refreshToken && !tokenPatch.privateData) return tokenPatch;
+  const data = tokenPatch.privateData
+    ? accountData({ ...resource, privateData: tokenPatch.privateData })
+    : originalData;
+  let response;
+  try {
+    response = await context.network.fetch(USAGE_URL, {
+      method: "GET",
+      headers: accountHeaders(data),
+    });
+  } catch (error) {
+    if (tokenPatch.privateData) return tokenPatch;
+    throw error;
+  }
   if (response.status < 200 || response.status >= 300) {
     if (response.status === 401) {
       return {
+        ...tokenPatch,
         state: { status: "invalid", message: "ChatGPT authorization expired; sign in again" },
       };
     }
+    if (tokenPatch.privateData) return tokenPatch;
     throw new Error(`Codex usage lookup failed (HTTP ${response.status}): ${response.body}`);
   }
   let body: unknown;
   try {
     body = JSON.parse(response.body);
   } catch {
+    if (tokenPatch.privateData) return tokenPatch;
     throw new Error("Codex usage lookup returned invalid JSON");
   }
   const quota = parseCodexUsage(body);
   return {
+    ...tokenPatch,
     privateData: { ...data, quota } as unknown as JsonValue,
     state: quotaState(quota),
+  };
+}
+
+/** Refreshes and persists OAuth token rotation without changing credentials that lack a refresh token. */
+export async function refreshAccountToken(
+  resource: ResourceSnapshot,
+  context: PluginContext,
+): Promise<ResourcePatch> {
+  const data = accountData(resource);
+  if (!data.refreshToken) return {};
+
+  let response;
+  try {
+    response = await context.network.fetch(OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: data.refreshToken,
+        client_id: OAUTH_CLIENT_ID,
+      }).toString(),
+    });
+  } catch {
+    return {};
+  }
+
+  let body: Record<string, unknown> = {};
+  try {
+    body = object(JSON.parse(response.body)) ?? {};
+  } catch {
+    if (response.status >= 200 && response.status < 300) {
+      return {};
+    }
+  }
+  if (response.status < 200 || response.status >= 300) {
+    const error = text(body.error) ?? "";
+    const message = text(body.error_description) ?? "";
+    if (`${error} ${message}`.toLowerCase().includes("invalid_grant")) {
+      return {
+        state: { status: "invalid", message: "ChatGPT authorization expired; sign in again" },
+      };
+    }
+    return {};
+  }
+
+  const accessToken = text(body.access_token);
+  if (!accessToken) return {};
+  const updatedData: AccountData = {
+    ...data,
+    accessToken,
+    refreshToken: text(body.refresh_token) ?? data.refreshToken,
+    accountId: data.accountId ?? chatGptAccountId(accessToken),
+  };
+  return {
+    privateData: updatedData as unknown as JsonValue,
+    state: { status: "ready" },
   };
 }
 

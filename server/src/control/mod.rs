@@ -132,6 +132,7 @@ pub fn api_router(service: ControlService) -> Router {
         .route("/__byok-api__/api/llm-calls", get(calls::list))
         .route("/__byok-api__/api/llm-calls/{call_id}", get(calls::detail))
         .route("/__byok-api__/api/plugins", get(plugins::list))
+        .route("/__byok-api__/api/plugins/updates", get(plugins::updates))
         .route(
             "/__byok-api__/api/plugins/runtime",
             get(plugins::runtime_status)
@@ -144,7 +145,7 @@ pub fn api_router(service: ControlService) -> Router {
         )
         .route(
             "/__byok-api__/api/plugins/{plugin_id}",
-            axum::routing::delete(plugins::remove),
+            axum::routing::delete(plugins::remove).post(plugins::update),
         )
         .route(
             "/__byok-api__/api/plugins/{plugin_id}/resources/{resource_type}/add/{method_id}/begin",

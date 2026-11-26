@@ -20,6 +20,7 @@ use super::{
     oauth_callback::{self, CallbackHandle, CallbackOutcome, CallbackRequest},
     runtime::PluginRuntime,
     state::{now_ms, PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel},
+    update::{PluginUpdateInfo, PluginUpdateStage, PluginUpdater},
     wire,
     worker::{PluginWorker, WorkerStreamItem},
 };
@@ -44,6 +45,7 @@ struct RegistryInner {
     runtime: PluginRuntime,
     catalog: PluginCatalog,
     state: PluginStateStore,
+    updater: PluginUpdater,
     entries: RwLock<Option<Vec<PluginEntry>>>,
     workers: Mutex<HashMap<String, Arc<PluginWorker>>>,
     oauth_sessions: Mutex<HashMap<String, OAuthSession>>,
@@ -135,12 +137,15 @@ pub struct PluginInvocationPlan {
 impl PluginRegistry {
     pub fn managed(store: Store, runtime: PluginRuntime, app_version: String) -> Result<Self> {
         let data = PluginDataStore::managed()?;
+        let catalog = PluginCatalog::managed(app_version.clone())?;
+        let updater = PluginUpdater::managed(store.clone(), app_version)?;
         Ok(Self {
             inner: Arc::new(RegistryInner {
                 store,
                 runtime,
-                catalog: PluginCatalog::managed(app_version)?,
+                catalog,
                 state: PluginStateStore::new(data),
+                updater,
                 entries: RwLock::new(None),
                 workers: Mutex::new(HashMap::new()),
                 oauth_sessions: Mutex::new(HashMap::new()),
@@ -171,6 +176,18 @@ impl PluginRegistry {
             plugins.push(self.descriptor(&entry, &executable).await);
         }
         plugins
+    }
+
+    pub async fn plugin_updates(&self, force_refresh: bool) -> Result<Vec<PluginUpdateInfo>> {
+        self.inner.updater.available(force_refresh).await
+    }
+
+    pub async fn update_plugin(&self, plugin_id: &str) -> Result<PluginUpdateStage> {
+        let executable = self.executable()?;
+        self.inner
+            .updater
+            .install(plugin_id, &executable, self.inner.catalog.loader())
+            .await
     }
 
     /// 已满足调用条件的全部插件模型;每个模型独立进入 Cursor 目录。
@@ -811,17 +828,29 @@ impl PluginRegistry {
     ) -> Result<()> {
         let executable = self.executable()?;
         let entry = self.find_entry(&executable, plugin_id).await?;
-        let resource = find_resource(&entry, resource_type)?;
-        if !resource.can_refresh {
-            return Err(Error::Config(format!(
-                "plugin '{plugin_id}' resource '{resource_type}' does not support refresh"
-            )));
-        }
         let record = self
             .find_record(plugin_id, resource_type, resource_id)
             .await?;
+        self.refresh_resource_record(&entry, &executable, resource_type, &record)
+            .await
+    }
+
+    async fn refresh_resource_record(
+        &self,
+        entry: &PluginEntry,
+        executable: &Path,
+        resource_type: &str,
+        record: &ResourceRecord,
+    ) -> Result<()> {
+        let resource = find_resource(entry, resource_type)?;
+        if !resource.can_refresh {
+            return Err(Error::Config(format!(
+                "plugin '{}' resource '{}' does not support refresh",
+                entry.manifest.id, resource_type
+            )));
+        }
         let value = self
-            .worker(&entry, &executable)
+            .worker(entry, executable)
             .await
             .invoke(
                 "resource.refresh",
@@ -835,7 +864,7 @@ impl PluginRegistry {
         let patch: ResourcePatch = serde_json::from_value(value)?;
         self.inner
             .state
-            .apply_patch(plugin_id, resource_type, resource_id, patch)
+            .apply_patch(&entry.manifest.id, resource_type, &record.id, patch)
             .await
     }
 
@@ -1148,7 +1177,20 @@ impl PluginRegistry {
         let plugin_id = &entry.manifest.id;
         let resource = match &provider.resource_type {
             Some(resource_type) => {
-                let record = self.select_resource(plugin_id, resource_type).await?;
+                let mut record = self.select_resource(plugin_id, resource_type).await?;
+                if provider.refresh_resource_before_list {
+                    self.refresh_resource_record(entry, executable, resource_type, &record)
+                        .await?;
+                    record = self
+                        .find_record(plugin_id, resource_type, &record.id)
+                        .await?;
+                    if matches!(&record.state, super::state::ResourceState::Invalid { .. }) {
+                        return Err(Error::Provider(format!(
+                            "plugin '{}' resource '{}' is invalid after refresh",
+                            plugin_id, resource_type
+                        )));
+                    }
+                }
                 Some(record.snapshot(resource_type))
             }
             None => None,

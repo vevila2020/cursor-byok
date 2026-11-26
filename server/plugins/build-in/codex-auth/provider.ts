@@ -5,6 +5,7 @@ import type {
   ProviderSupport,
 } from "cursor-byok:provider";
 import type { PluginContext } from "cursor-byok:plugin";
+import type { ResourcePatch } from "cursor-byok:resource";
 import { HttpError, streamOpenAiResponses } from "cursor-byok:protocol/openai-responses";
 import { codexModels, reasoningEfforts } from "./models.ts";
 import {
@@ -12,6 +13,7 @@ import {
   accountData,
   chatGptAccountId,
   quotaExhaustedPatch,
+  refreshAccountToken,
   RESOURCE_TYPE,
 } from "./resources.ts";
 
@@ -21,6 +23,7 @@ const RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 export function isQuotaError(error: string): boolean {
   const message = error.toLowerCase();
   return message.includes("insufficient_quota") ||
+    message.includes("credit_balance_exhausted") ||
     message.includes("usage_limit_reached") ||
     message.includes("exceeded your current quota") ||
     message.includes("quota_exceeded") ||
@@ -44,11 +47,15 @@ function isQuotaHttpError(error: HttpError): boolean {
       (body.includes("quota") || body.includes("usage_limit") || body.includes("insufficient")));
 }
 
-function invalidResult(message: string, stateMessage: string): ProviderResult {
+function invalidResult(
+  message: string,
+  stateMessage: string,
+  patch?: ResourcePatch,
+): ProviderResult {
   return {
     status: "resource-error",
     message,
-    patch: { state: { status: "invalid", message: stateMessage } },
+    patch: { ...patch, state: { status: "invalid", message: stateMessage } },
   };
 }
 
@@ -67,6 +74,57 @@ function headers(data: AccountData, cacheKey: string | null): Record<string, str
     result["x-client-request-id"] = cacheKey;
   }
   return result;
+}
+
+async function streamRequest(
+  data: AccountData,
+  modelId: string,
+  request: ProviderInvokeInput["request"],
+  effort: string | null,
+  output: ProviderOutput,
+  context: PluginContext,
+): Promise<void> {
+  await streamOpenAiResponses(
+    {
+      url: RESPONSES_URL,
+      model: modelId,
+      // Codex subscription endpoint doesn't accept max_output_tokens; fast maps to service_tier=priority.
+      request: {
+        ...request,
+        reasoning: { enabled: request.reasoning.enabled, effort },
+        maxOutputTokens: null,
+      },
+      headers: headers(data, request.cacheKey),
+      extraBody: { store: false },
+    },
+    output,
+    context,
+  );
+}
+
+function invokeErrorResult(
+  error: Error,
+  data: AccountData,
+  patch?: ResourcePatch,
+): ProviderResult {
+  if (error instanceof HttpError) {
+    if (error.status === 401) {
+      return invalidResult(error.message, "ChatGPT authorization expired; sign in again", patch);
+    }
+    if (isQuotaHttpError(error)) {
+      return {
+        status: "resource-error",
+        message: error.message,
+        patch: quotaExhaustedPatch(data, error.body),
+      };
+    }
+    return { status: "request-error", message: error.message, ...(patch ? { patch } : {}) };
+  }
+  const message = error.message;
+  if (isQuotaError(message)) {
+    return { status: "resource-error", message, patch: quotaExhaustedPatch(data, message) };
+  }
+  return { status: "request-error", message, ...(patch ? { patch } : {}) };
 }
 
 async function invoke(
@@ -90,43 +148,45 @@ async function invoke(
     ? reasoning.effort
     : null;
   try {
-    await streamOpenAiResponses(
-      {
-        url: RESPONSES_URL,
-        model: input.model.id,
-        // Codex 订阅端点不接受 max_output_tokens;fast 档位经协议库映射为
-        // service_tier: "priority" 后透传。
-        request: {
-          ...input.request,
-          reasoning: { enabled: reasoning.enabled, effort },
-          maxOutputTokens: null,
-        },
-        headers: headers(data, input.request.cacheKey),
-        extraBody: { store: false },
-      },
-      output,
-      context,
-    );
+    await streamRequest(data, input.model.id, input.request, effort, output, context);
     return { status: "completed" };
   } catch (error) {
-    if (error instanceof HttpError) {
-      if (error.status === 401) {
-        return invalidResult(error.message, "ChatGPT authorization expired; sign in again");
+    const httpError = error instanceof HttpError ? error as HttpError : null;
+    if (httpError?.status === 401 && data.refreshToken) {
+      const refreshPatch = await refreshAccountToken(input.resource, context);
+      if (refreshPatch.privateData) {
+        const refreshedData = accountData({
+          ...input.resource,
+          privateData: refreshPatch.privateData,
+        });
+        try {
+          await streamRequest(
+            refreshedData,
+            input.model.id,
+            input.request,
+            effort,
+            output,
+            context,
+          );
+          return { status: "completed", patch: refreshPatch };
+        } catch (retryError) {
+          const retryErrorValue = retryError instanceof Error
+            ? retryError
+            : new Error(String(retryError));
+          return invokeErrorResult(retryErrorValue, refreshedData, refreshPatch);
+        }
       }
-      if (isQuotaHttpError(error)) {
-        return {
-          status: "resource-error",
-          message: error.message,
-          patch: quotaExhaustedPatch(data, error.body),
-        };
+      if (refreshPatch.state?.status === "invalid") {
+        return invalidResult(
+          httpError.message,
+          "ChatGPT authorization expired; sign in again",
+          refreshPatch,
+        );
       }
-      return { status: "request-error", message: error.message };
+      return { status: "request-error", message: httpError.message };
     }
-    const message = error instanceof Error ? error.message : String(error);
-    if (isQuotaError(message)) {
-      return { status: "resource-error", message, patch: quotaExhaustedPatch(data, message) };
-    }
-    return { status: "request-error", message };
+    const errorValue = error instanceof Error ? error : new Error(String(error));
+    return invokeErrorResult(errorValue, data);
   }
 }
 

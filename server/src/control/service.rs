@@ -168,6 +168,17 @@ impl ControlService {
         self.plugins.plugins().await
     }
 
+    pub async fn plugin_updates(
+        &self,
+        force_refresh: bool,
+    ) -> Result<Vec<crate::plugin::PluginUpdateInfo>> {
+        self.plugins.plugin_updates(force_refresh).await
+    }
+
+    pub async fn update_plugin(&self, plugin_id: &str) -> Result<crate::plugin::PluginUpdateStage> {
+        self.plugins.update_plugin(plugin_id).await
+    }
+
     pub async fn plugin_oauth_begin(
         &self,
         plugin_id: &str,
@@ -365,7 +376,9 @@ impl ControlService {
                 .await?
                 .ok_or_else(|| Error::RunNotFound(format!("model {model_hash}")))?;
             configured.configure(&mut model);
-            model.max_output_tokens = Some(configured.max_output_tokens().unwrap_or(65_536));
+            model.max_output_tokens = configured
+                .max_output_tokens()
+                .or_else(|| (configured.model_type != ModelType::Gemini).then_some(65_536));
         }
         let call_id = format!("model-test-{}", uuid::Uuid::new_v4());
         let invocation = ModelInvocation {
@@ -482,6 +495,7 @@ impl ControlService {
             match input.model_type {
                 ModelType::OpenAi => ProviderType::OpenAiResponses,
                 ModelType::Anthropic => ProviderType::Anthropic,
+                ModelType::Gemini => ProviderType::Gemini,
             },
             &base_url,
             &input.api_key,
@@ -816,6 +830,7 @@ async fn discover_models_from_endpoint(
         ProviderType::Anthropic => {
             anthropic_models(client, base_url, api_key, custom_headers).await?
         }
+        ProviderType::Gemini => gemini_models(client, base_url, api_key, custom_headers).await?,
         ProviderType::Plugin => {
             return Err(Error::Config(
                 "plugin providers discover models through their plugin".into(),
@@ -825,6 +840,61 @@ async fn discover_models_from_endpoint(
     models.sort();
     models.dedup();
     Ok(DiscoveredModels { models })
+}
+
+async fn gemini_models(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    custom_headers: &serde_json::Value,
+) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Entry {
+        name: String,
+        #[serde(default)]
+        supported_generation_methods: Vec<String>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Page {
+        #[serde(default)]
+        models: Vec<Entry>,
+        next_page_token: Option<String>,
+    }
+    let collection = crate::model::gemini_models_url(base_url)?;
+    let mut models = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut url = collection.clone();
+    loop {
+        let request = client.get(url).header("x-goog-api-key", api_key);
+        let page: Page = apply_discovery_headers(request, custom_headers)?
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        models.extend(
+            page.models
+                .into_iter()
+                .filter(|m| {
+                    m.supported_generation_methods
+                        .iter()
+                        .any(|s| s == "generateContent")
+                })
+                .filter_map(|m| m.name.strip_prefix("models/").map(str::to_owned)),
+        );
+        let Some(token) = page.next_page_token.filter(|t| !t.is_empty()) else {
+            return Ok(models);
+        };
+        if !seen.insert(token.clone()) {
+            return Err(Error::Provider(
+                "Gemini returned a repeated model page token".into(),
+            ));
+        }
+        url = collection.clone();
+        url.query_pairs_mut().append_pair("pageToken", &token);
+    }
 }
 
 fn model_discovery_url(base_url: &str) -> Result<Url> {

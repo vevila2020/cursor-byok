@@ -415,6 +415,8 @@ mod tests {
                 ..Migrator::DEFAULT
             };
             first_four.run(&pool).await.unwrap();
+            sqlx::query("INSERT INTO model_configs (model_hash, display_name, model_type, base_url, api_key, tooltip_data, model_id, created_at_ms, updated_at_ms) VALUES ('saved', 'Saved', 'anthropic', 'https://channel.test', 'fixture', 'saved', 'custom', 1, 2)")
+                .execute(&pool).await.unwrap();
             let checksum_before: Vec<u8> =
                 sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
                     .fetch_one(&pool)
@@ -456,7 +458,9 @@ mod tests {
             .unwrap();
 
             assert_eq!(checksum_after, checksum_before);
-            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+            assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            let saved: (String, String, i64, i64) = sqlx::query_as("SELECT model_type, model_id, created_at_ms, updated_at_ms FROM model_configs WHERE model_hash = 'saved'").fetch_one(&pool).await.unwrap();
+            assert_eq!(saved, ("anthropic".into(), "custom".into(), 1, 2));
             assert_eq!(checkpoint_table_exists, 1);
             assert_eq!(argument_error_column_exists, 1);
         }

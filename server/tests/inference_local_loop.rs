@@ -5,6 +5,8 @@
 mod fake_provider;
 #[path = "support/fixtures.rs"]
 mod fixtures;
+#[path = "support/gemini.rs"]
+mod gemini;
 
 use std::{sync::Arc, time::Duration};
 
@@ -652,6 +654,139 @@ async fn provider_replay_state_is_replayed_on_the_next_invocation() {
         assistant.as_ref().map(|state| state.provider_kind.as_str()),
         Some("openai_responses")
     );
+}
+
+#[tokio::test]
+async fn gemini_discovery_connectivity_and_local_parallel_tools() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let parts = vec![
+        json!({"functionCall":{"name":"Read","args":{"path":"a"},"id":"upstream-A"},"thoughtSignature":gemini::SIGNATURE}),
+        json!({"functionCall":{"name":"Read","args":{"path":"b"},"id":"upstream-B"}}),
+    ];
+    let mut channel = gemini::channel(&store, parts.clone()).await;
+    let mut discovery = cursor_server::control::ModelDiscoveryInput {
+        model_type: ModelType::Gemini,
+        base_url: channel.model.base_url.clone(),
+        api_key: "invalid".into(),
+        custom_headers_enabled: false,
+        custom_headers: json!({}),
+    };
+    assert!(channel
+        .control
+        .discover_models(&discovery)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("401"));
+    discovery.api_key = channel.model.api_key.clone();
+    assert_eq!(
+        channel
+            .control
+            .discover_models(&discovery)
+            .await
+            .unwrap()
+            .models,
+        [gemini::MODEL, "z"]
+    );
+    let tested = channel
+        .control
+        .test_model(&channel.model.model_hash, "gemini-test")
+        .await
+        .unwrap();
+    assert_eq!(tested.output, "all done");
+    assert_eq!(tested.output_tokens, 4);
+    assert!(channel
+        .requests
+        .try_recv()
+        .unwrap()
+        .get("generationConfig")
+        .is_none());
+    let registry = InferenceRegistry::new(
+        store.clone(),
+        channel.provider.clone(),
+        CursorTraceService::new(store),
+    );
+    let id = "gemini-inference";
+    let handle = registry.ensure_local(id, None, None).await.unwrap();
+    let mut output = handle.subscribe();
+    registry
+        .append(id, run_request(selection(&channel.model.model_hash, &[])))
+        .await
+        .unwrap();
+    next_message(&mut output).await;
+    registry
+        .append(
+            id,
+            invoke(
+                "first",
+                InferenceStreamRequest {
+                    tools: vec![InferenceAgentTool {
+                        name: "Read".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(drain_invocation(&mut output).await.error.is_none());
+    let _first = channel.requests.try_recv().unwrap();
+    let calls = ["upstream-B", "upstream-A"]
+        .into_iter()
+        .map(|id| InferenceToolCall {
+            tool_call_id: id.into(),
+            tool_name: "Read".into(),
+            ..Default::default()
+        })
+        .collect();
+    let results = ["upstream-B", "upstream-A"]
+        .into_iter()
+        .map(|id| InferenceToolResultPart {
+            tool_call_id: id.into(),
+            tool_name: "Read".into(),
+            result: Some(prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue(id.into())),
+            }),
+            ..Default::default()
+        })
+        .collect();
+    registry
+        .append(
+            id,
+            invoke(
+                "second",
+                InferenceStreamRequest {
+                    messages: vec![
+                        InferenceCoreMessage {
+                            role: MESSAGE_ROLE_ASSISTANT,
+                            tool_calls: calls,
+                            ..Default::default()
+                        },
+                        InferenceCoreMessage {
+                            role: MESSAGE_ROLE_TOOL,
+                            content: Some(inference_core_message::Content::ToolContent(
+                                InferenceToolResultContent { parts: results },
+                            )),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let end = drain_invocation(&mut output).await;
+    assert!(end.error.is_none(), "{:?}", end.error);
+    let second = channel.requests.try_recv().unwrap();
+    assert_eq!(second["contents"][0]["parts"][1], parts[0]);
+    assert_eq!(second["contents"][0]["parts"][2], parts[1]);
+    let responses = second["contents"][1]["parts"].as_array().unwrap();
+    for (part, id) in responses.iter().zip(["upstream-A", "upstream-B"]) {
+        assert_eq!(part["functionResponse"]["id"], id);
+        assert_eq!(part["functionResponse"]["response"]["output"], id);
+    }
 }
 
 async fn drain_invocation(

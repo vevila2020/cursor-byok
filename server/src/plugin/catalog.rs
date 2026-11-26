@@ -65,7 +65,7 @@ impl PluginCatalog {
     }
 
     pub(crate) async fn entries(&self, executable: &Path) -> Vec<PluginEntry> {
-        let mut plugins = BTreeMap::new();
+        let mut plugins: BTreeMap<String, PluginEntry> = BTreeMap::new();
         for root in &self.roots {
             let mut directories = match child_directories(root) {
                 Ok(value) => value,
@@ -84,13 +84,19 @@ impl PluginCatalog {
                 )
                 .await
                 {
-                    Ok(entry) => {
-                        if plugins.contains_key(&entry.manifest.id) {
+                    Ok(entry) => match plugins.get(&entry.manifest.id) {
+                        Some(existing)
+                            if !plugin_version_newer(
+                                &entry.manifest.version,
+                                &existing.manifest.version,
+                            ) =>
+                        {
                             tracing::warn!(plugin = %entry.manifest.id, path = %directory.display(), "ignoring duplicate plugin");
-                        } else {
+                        }
+                        _ => {
                             plugins.insert(entry.manifest.id.clone(), entry);
                         }
-                    }
+                    },
                     Err(error) => {
                         tracing::warn!(path = %directory.display(), %error, "ignoring invalid plugin")
                     }
@@ -101,7 +107,7 @@ impl PluginCatalog {
     }
 
     pub(crate) fn manifests(&self) -> Vec<(PluginManifest, String)> {
-        let mut plugins = BTreeMap::new();
+        let mut plugins: BTreeMap<String, (PluginManifest, String)> = BTreeMap::new();
         for root in &self.roots {
             let Ok(mut directories) = child_directories(root) else {
                 continue;
@@ -117,13 +123,39 @@ impl PluginCatalog {
                     Ok((manifest, icon))
                 })();
                 if let Ok((manifest, icon)) = loaded {
-                    plugins
-                        .entry(manifest.id.clone())
-                        .or_insert((manifest, icon));
+                    match plugins.get(&manifest.id) {
+                        Some((existing, _))
+                            if !plugin_version_newer(&manifest.version, &existing.version) => {}
+                        _ => {
+                            plugins.insert(manifest.id.clone(), (manifest, icon));
+                        }
+                    }
                 }
             }
         }
         plugins.into_values().collect()
+    }
+}
+
+fn plugin_version_newer(candidate: &str, current: &str) -> bool {
+    match (
+        super::manifest::parse_version(candidate),
+        super::manifest::parse_version(current),
+    ) {
+        (Some(candidate), Some(current)) => candidate > current,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod version_precedence_tests {
+    use super::plugin_version_newer;
+
+    #[test]
+    fn installed_plugin_update_takes_precedence_over_embedded_source() {
+        assert!(plugin_version_newer("0.1.10", "0.1.9"));
+        assert!(!plugin_version_newer("0.1.9", "0.1.9"));
+        assert!(!plugin_version_newer("0.1.8", "0.1.9"));
     }
 }
 
@@ -142,7 +174,7 @@ fn child_directories(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// 应用过旧时拒绝加载,让插件的 minAppVersion 声明生效。
-fn require_app_version(manifest: &PluginManifest, app_version: &str) -> Result<()> {
+pub(super) fn require_app_version(manifest: &PluginManifest, app_version: &str) -> Result<()> {
     let Some(minimum) = &manifest.min_app_version else {
         return Ok(());
     };
@@ -196,7 +228,10 @@ fn validate_localized_text(value: &serde_json::Value, label: &str) -> Result<()>
     }
 }
 
-fn validate_definition(plugin_id: &str, definition: &PluginModuleDefinition) -> Result<()> {
+pub(super) fn validate_definition(
+    plugin_id: &str,
+    definition: &PluginModuleDefinition,
+) -> Result<()> {
     if definition.providers.is_empty() {
         return Err(Error::Config(format!(
             "plugin '{plugin_id}' must define at least one provider"

@@ -452,13 +452,14 @@ fn unary_payload(body: &Bytes) -> Result<(bool, &[u8])> {
 
 fn available_model(model: &ModelConfig) -> AvailableModel {
     let contexts = context_options(model.context_window_tokens);
+    let adjustable = model.model_type != crate::model::ModelType::Gemini;
     let tooltip = model_tooltip(model);
     let variants = model_variants(
         &model.model_hash,
         &model.display_name,
         &tooltip,
         &contexts,
-        true,
+        adjustable,
         Some(model),
     );
     let legacy_slugs = variants
@@ -483,7 +484,10 @@ fn available_model(model: &ModelConfig) -> AvailableModel {
         inputbox_short_model_name: Some(model.display_name.clone()),
         supports_sandboxing: Some(true),
         supports_cmd_k: Some(false),
-        parameter_definitions: model_parameters(&contexts, true),
+        parameter_definitions: model_parameters(&contexts, adjustable)
+            .into_iter()
+            .filter(|p| adjustable || p.id != "fast")
+            .collect(),
         variants,
         legacy_slugs,
         named_model_section_index: Some(1),
@@ -611,6 +615,9 @@ fn model_variants(
         };
         for effort in efforts {
             for fast in [false, true] {
+                if fast && config.is_some_and(|m| m.model_type == crate::model::ModelType::Gemini) {
+                    continue;
+                }
                 let is_default = is_default_context
                     && !fast
                     && effort.is_none_or(|(value, _)| value == default_effort);

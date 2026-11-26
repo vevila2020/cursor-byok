@@ -634,7 +634,7 @@ async fn run_invocation(
                         }
                     }
                 }
-                if state.provider_kind == "openai_responses" {
+                if matches!(state.provider_kind.as_str(), "gemini" | "openai_responses") {
                     events
                         .send(SessionEvent::Replay {
                             call_ids: tool_call_ids.clone(),
