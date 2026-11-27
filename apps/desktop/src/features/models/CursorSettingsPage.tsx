@@ -335,7 +335,7 @@ export function CursorSettingsPage() {
     </PageActions>
     <PageActions>
       <TooltipTrigger label={cursorTakenOver ? t("启动 Cursor") : t("开启接管后可启动 Cursor")}>
-        <Button variant="primary" size="small" className={styles.launchButton} disabled={cursorBusy || !cursorTakenOver} onClick={() => void launchCursor()}><span className={styles.launchLabel}>{t("启动 Cursor")}</span></Button>
+        <Button variant="primary" size="small" className={styles.launchButton} disabled={cursorBusy || !cursorTakenOver} onClick={() => void launchCursor()}>{t("启动 Cursor")}</Button>
       </TooltipTrigger>
       <TooltipTrigger label={caReady ? t("添加模型") : t("请先初始化 CA")}><button className={controls.iconButton} aria-label={t("添加模型")} disabled={!caReady || cursorBusy} onClick={openNew}><Icon icon={addIcon} size="1.1em" /></button></TooltipTrigger>
     </PageActions>
